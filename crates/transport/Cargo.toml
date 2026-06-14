@@ -12,7 +12,13 @@ publish = false
 [lints]
 workspace = true
 
-# Dependency-free in Slice 0. Async runtimes, TLS, and JSON-RPC framing crates
-# arrive with the slices that need them (endpoint in Slice 3, control channel in
-# Slice 5), each justified in its PR.
 [dependencies]
+mcp-lock-core = { path = "../core" }
+# Synchronous, thread-per-connection HTTP server for the MCP endpoint. Chosen
+# over an async stack (tokio/hyper/axum) to keep the broker fully synchronous —
+# the security core is sync and there is no high-concurrency requirement for a
+# local single-user broker. Small, permissive dep tree (ascii, chunked_transfer,
+# httpdate, log); no TLS (loopback only in v1; remote mTLS is a documented
+# follow-up) and no async runtime.
+tiny_http = "0.12"
+serde_json = "1"
