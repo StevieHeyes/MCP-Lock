@@ -19,13 +19,24 @@ use std::fmt;
 use serde_json::{json, Value};
 
 use mcp_lock_core::broker::{BrokerState, ServerSlot};
-use mcp_lock_core::manifest::{LoadedManifest, ServerManifest};
+use mcp_lock_core::manifest::{LoadedManifest, ServerManifest, ToolClass};
 use mcp_lock_core::policy::{classify_advertised, ClassifiedTool, ServerState, Timestamp};
 
 use crate::mcp_client::{ChildError, McpChild};
 
 /// Separator between server id and tool name in an aggregated tool name.
 pub const NAMESPACE_SEP: char = '.';
+
+/// How long a per-action confirmation remains usable after it is approved
+/// (seconds). Short: a confirm authorises one imminent action, not a window.
+pub const CONFIRMATION_TTL_SECS: u64 = 30;
+
+/// A single-use approval for a `confirm`-classified tool action.
+struct Confirmation {
+    server_id: String,
+    tool: String,
+    approved_at: Timestamp,
+}
 
 /// A function that spawns a child for a given server. Stored so a stopped server
 /// can be re-spawned by [`Aggregator::start`].
@@ -50,6 +61,9 @@ pub enum AggregatorError {
     UnknownTool(String),
     /// The tool exists but is not currently exposed (gated by policy).
     NotExposed(String),
+    /// A `confirm`-classified tool was called without a fresh per-action
+    /// confirmation.
+    NotConfirmed(String),
     /// The underlying child failed.
     Child(ChildError),
 }
@@ -64,6 +78,9 @@ impl fmt::Display for AggregatorError {
             AggregatorError::UnknownTool(name) => write!(f, "unknown tool: {name}"),
             AggregatorError::NotExposed(name) => {
                 write!(f, "tool not currently exposed: {name}")
+            }
+            AggregatorError::NotConfirmed(name) => {
+                write!(f, "tool requires a fresh per-action confirmation: {name}")
             }
             AggregatorError::Child(e) => write!(f, "{e}"),
         }
@@ -93,6 +110,8 @@ pub struct Aggregator {
     children: BTreeMap<String, Box<dyn McpChild>>,
     /// server id -> (tool name -> full tool definition from the child).
     tool_defs: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Outstanding single-use per-action confirmations for `confirm` tools.
+    confirmations: Vec<Confirmation>,
 }
 
 // Hand-written: the trait objects in `children` are not Debug.
@@ -157,7 +176,29 @@ impl Aggregator {
             state: BrokerState::cold_start(slots),
             children,
             tool_defs,
+            confirmations: Vec::new(),
         })
+    }
+
+    /// The classification of a tool, if the server and tool are known.
+    pub fn tool_class(&self, server_id: &str, tool: &str) -> Option<ToolClass> {
+        self.state
+            .server(server_id)?
+            .tools()
+            .iter()
+            .find(|t| t.name == tool)
+            .map(|t| t.class)
+    }
+
+    /// Record a verified per-action confirmation for a `confirm` tool. The next
+    /// call to that tool within [`CONFIRMATION_TTL_SECS`] consumes it.
+    pub fn approve_action(&mut self, server_id: &str, tool: &str, now: Timestamp) {
+        self.confirmations.retain(|c| !confirmation_expired(c, now));
+        self.confirmations.push(Confirmation {
+            server_id: server_id.to_string(),
+            tool: tool.to_string(),
+            approved_at: now,
+        });
     }
 
     /// Pause a server: routing-level only (the process keeps running, so resume
@@ -251,13 +292,38 @@ impl Aggregator {
             .split_once(NAMESPACE_SEP)
             .ok_or_else(|| AggregatorError::UnknownTool(external_name.to_string()))?;
 
-        let slot = self
-            .state
-            .server(server_id)
-            .ok_or_else(|| AggregatorError::UnknownTool(external_name.to_string()))?;
+        // Read what we need from the slot, then drop the borrow.
+        let (exposed, class) = {
+            let slot = self
+                .state
+                .server(server_id)
+                .ok_or_else(|| AggregatorError::UnknownTool(external_name.to_string()))?;
+            let exposed = slot.exposed(now);
+            let class = slot
+                .tools()
+                .iter()
+                .find(|t| t.name == tool)
+                .map(|t| t.class);
+            (exposed, class)
+        };
 
-        if !slot.exposed(now).iter().any(|t| t == tool) {
+        if !exposed.iter().any(|t| t == tool) {
             return Err(AggregatorError::NotExposed(external_name.to_string()));
+        }
+
+        // A confirm-classified tool needs a fresh, single-use per-action
+        // confirmation, even while elevated. The model cannot supply one, so
+        // these stay closed unless an operator has just approved this exact tool.
+        if matches!(class, Some(c) if c.requires_per_action_presence()) {
+            let position = self.confirmations.iter().position(|c| {
+                c.server_id == server_id && c.tool == tool && !confirmation_expired(c, now)
+            });
+            match position {
+                Some(i) => {
+                    self.confirmations.swap_remove(i);
+                }
+                None => return Err(AggregatorError::NotConfirmed(external_name.to_string())),
+            }
         }
 
         let child = self
@@ -319,6 +385,10 @@ impl Aggregator {
     pub fn exposure_snapshot(&self, now: Timestamp) -> BTreeMap<String, Vec<String>> {
         self.state.exposure_snapshot(now)
     }
+}
+
+fn confirmation_expired(c: &Confirmation, now: Timestamp) -> bool {
+    now.saturating_sub(c.approved_at) > CONFIRMATION_TTL_SECS
 }
 
 /// Spawn a child for `server`, list its tools, and classify them against the
@@ -663,6 +733,34 @@ mod tests {
             names(&agg.aggregated_tools(0)),
             vec!["mail.fetch_message", "mail.search"]
         );
+    }
+
+    #[test]
+    fn confirm_tool_requires_fresh_approval_even_when_elevated() {
+        let manifest = br#"{"servers":[{"id":"mail","command":"x","tools":{"send":"confirm"}}]}"#;
+        let loaded = load_from_bytes(manifest).unwrap();
+        let mut agg = Aggregator::build(&loaded, |_| {
+            Ok(Box::new(FakeChild::with_tools(&["send"])) as Box<dyn McpChild>)
+        })
+        .unwrap();
+        // Elevate so the confirm tool is exposed.
+        agg.state_mut()
+            .server_mut("mail")
+            .unwrap()
+            .grant_elevation(Elevation::until_revoked(0));
+        // Exposed, but no fresh confirmation -> rejected.
+        assert!(matches!(
+            agg.call("mail.send", json!({}), 0),
+            Err(AggregatorError::NotConfirmed(_))
+        ));
+        // Approve, then exactly one call goes through.
+        agg.approve_action("mail", "send", 0);
+        assert!(agg.call("mail.send", json!({}), 0).is_ok());
+        // Single-use: the next call needs a fresh approval.
+        assert!(matches!(
+            agg.call("mail.send", json!({}), 0),
+            Err(AggregatorError::NotConfirmed(_))
+        ));
     }
 
     #[test]

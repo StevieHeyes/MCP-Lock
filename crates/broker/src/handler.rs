@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
+use mcp_lock_core::audit::{AuditEvent, AuditLog};
 use mcp_lock_core::auth::ValidatedClient;
 use mcp_lock_core::policy::Timestamp;
 use mcp_lock_transport::endpoint::McpHandler;
@@ -22,9 +23,12 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// An [`McpHandler`] backed by the broker's aggregator.
 pub struct BrokerMcpHandler {
     aggregator: Arc<Mutex<Aggregator>>,
+    /// The audit tape; a successful write-class tool call is recorded here.
+    audit: Arc<AuditLog>,
     /// Monotonic base; `now()` is seconds since the handler was created. Used for
-    /// elevation-expiry checks in exposure resolution (no elevations exist until
-    /// Slice 5, but the clock is consistent from the start).
+    /// elevation-expiry checks in exposure resolution. The same clock the control
+    /// handler uses would differ; this is acceptable because each handler only
+    /// compares its own grants/expiries.
     clock_base: Instant,
 }
 
@@ -35,10 +39,11 @@ impl std::fmt::Debug for BrokerMcpHandler {
 }
 
 impl BrokerMcpHandler {
-    /// Wrap a shared aggregator.
-    pub fn new(aggregator: Arc<Mutex<Aggregator>>) -> Self {
+    /// Wrap a shared aggregator and the audit log.
+    pub fn new(aggregator: Arc<Mutex<Aggregator>>, audit: Arc<AuditLog>) -> Self {
         BrokerMcpHandler {
             aggregator,
+            audit,
             clock_base: Instant::now(),
         }
     }
@@ -68,15 +73,33 @@ impl BrokerMcpHandler {
             .unwrap_or_else(|| json!({}));
         let now = self.now();
 
-        let mut agg = match self.aggregator.lock() {
-            Ok(agg) => agg,
-            Err(_) => return internal_error(id),
+        let (class, result) = {
+            let mut agg = match self.aggregator.lock() {
+                Ok(agg) => agg,
+                Err(_) => return internal_error(id),
+            };
+            let class = name
+                .split_once('.')
+                .and_then(|(server, tool)| agg.tool_class(server, tool));
+            (class, agg.call(name, arguments, now))
         };
-        match agg.call(name, arguments, now) {
-            Ok(result) => success(id, result),
-            // Any tool-level problem (unknown/not-exposed/child failure) is
-            // returned as a tool result with isError so the model can see and
-            // adjust, not as a JSON-RPC protocol error.
+
+        match result {
+            Ok(result) => {
+                // Record write-class invocations on the audit tape.
+                if matches!(class, Some(c) if c.requires_elevation()) {
+                    if let Some((server_id, tool)) = name.split_once('.') {
+                        self.audit.record(AuditEvent::WriteToolInvoked {
+                            server_id: server_id.to_string(),
+                            tool: tool.to_string(),
+                        });
+                    }
+                }
+                success(id, result)
+            }
+            // Any tool-level problem (unknown/not-exposed/not-confirmed/child
+            // failure) is returned as a tool result with isError so the model can
+            // see and adjust, not as a JSON-RPC protocol error.
             Err(e) => success(id, tool_error_result(&e.to_string())),
         }
     }
@@ -156,7 +179,7 @@ mod tests {
         let loaded = load_from_bytes(MANIFEST).unwrap();
         let agg =
             Aggregator::build(&loaded, |_| Ok(Box::new(FakeChild) as Box<dyn McpChild>)).unwrap();
-        BrokerMcpHandler::new(Arc::new(Mutex::new(agg)))
+        BrokerMcpHandler::new(Arc::new(Mutex::new(agg)), Arc::new(AuditLog::in_memory()))
     }
 
     fn fake_client() -> ValidatedClient {

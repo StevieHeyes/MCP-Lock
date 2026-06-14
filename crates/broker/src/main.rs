@@ -13,8 +13,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
+use mcp_lock_core::audit::AuditLog;
 use mcp_lock_core::auth::StaticBearerValidator;
 use mcp_lock_core::broker::BrokerState;
+use mcp_lock_core::elevation::{ClientRegistry, PUBLIC_KEY_LEN};
 use mcp_lock_core::exec::ExecutionContext;
 use mcp_lock_core::manifest::{self, ServerManifest};
 use mcp_lock_transport::control::{self, ControlHandler, ControlServer};
@@ -33,6 +35,11 @@ const TOKEN_ENV: &str = "MCPLOCK_BEARER_TOKEN";
 /// Env var for the listen address. Defaults to loopback.
 const LISTEN_ENV: &str = "MCPLOCK_LISTEN";
 const DEFAULT_LISTEN: &str = "127.0.0.1:8765";
+/// Env var: path to the client-registration JSON ({ "id": "<hex pubkey>" }).
+/// Absent => empty registry => no client can elevate (ship closed).
+const CLIENTS_ENV: &str = "MCPLOCK_CLIENTS";
+/// Env var: path to the append-only audit log. Absent => in-memory only.
+const AUDIT_ENV: &str = "MCPLOCK_AUDIT_LOG";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -109,13 +116,22 @@ fn serve(path: PathBuf) -> ExitCode {
         }
     };
 
-    // Share the aggregator and the notifier between the MCP endpoint and the
-    // control channel, so a lifecycle change on the control channel fires
-    // tools/list_changed to MCP clients.
+    // Client registry (signing keys) and audit log.
+    let registry = Arc::new(load_registry());
+    if registry.is_empty() {
+        eprintln!(
+            "mcp-lockd: no clients registered ({CLIENTS_ENV} unset/empty) — elevation disabled (ship closed)"
+        );
+    }
+    let audit = Arc::new(load_audit());
+
+    // Share the aggregator, notifier, and audit between the MCP endpoint and the
+    // control channel, so a lifecycle/elevation change fires tools/list_changed
+    // to MCP clients and write-tool calls reach the same audit tape.
     let aggregator = Arc::new(Mutex::new(aggregator));
     let notifier = Notifier::new();
 
-    let mcp_handler = Arc::new(BrokerMcpHandler::new(aggregator.clone()));
+    let mcp_handler = Arc::new(BrokerMcpHandler::new(aggregator.clone(), audit.clone()));
     let listen = std::env::var(LISTEN_ENV).unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
     let endpoint =
         match HttpEndpoint::bind(&listen, Arc::new(validator), mcp_handler, notifier.clone()) {
@@ -126,9 +142,9 @@ fn serve(path: PathBuf) -> ExitCode {
             }
         };
 
-    // Start the local control channel (observe + lifecycle). A failure here is
-    // non-fatal: the MCP endpoint still serves read-only.
-    start_control_channel(aggregator, notifier);
+    // Start the local control channel (observe + lifecycle + elevation). A
+    // failure here is non-fatal: the MCP endpoint still serves read-only.
+    start_control_channel(aggregator, notifier, registry, audit);
 
     eprintln!(
         "mcp-lockd: MCP endpoint listening on http://{} (read-only until elevated)",
@@ -139,10 +155,16 @@ fn serve(path: PathBuf) -> ExitCode {
 }
 
 /// Bind the control socket and serve it on a background thread.
-fn start_control_channel(aggregator: Arc<Mutex<Aggregator>>, notifier: Notifier) {
+fn start_control_channel(
+    aggregator: Arc<Mutex<Aggregator>>,
+    notifier: Notifier,
+    registry: Arc<ClientRegistry>,
+    audit: Arc<AuditLog>,
+) {
     let path = control::socket_path();
-    let handler: Arc<dyn ControlHandler> =
-        Arc::new(BrokerControlHandler::new(aggregator, notifier));
+    let handler: Arc<dyn ControlHandler> = Arc::new(BrokerControlHandler::new(
+        aggregator, notifier, registry, audit,
+    ));
     match ControlServer::bind(&path) {
         Ok(server) => {
             eprintln!("mcp-lockd: control socket at {}", path.display());
@@ -150,6 +172,80 @@ fn start_control_channel(aggregator: Arc<Mutex<Aggregator>>, notifier: Notifier)
         }
         Err(e) => {
             eprintln!("mcp-lockd: warning: control channel unavailable ({e})");
+        }
+    }
+}
+
+/// Load registered client signing keys from the `MCPLOCK_CLIENTS` JSON file
+/// (`{ "client_id": "<hex pubkey>" }`). A missing/unreadable/invalid file yields
+/// an empty registry (ship closed) with a warning.
+fn load_registry() -> ClientRegistry {
+    let mut registry = ClientRegistry::new();
+    let Some(path) = std::env::var_os(CLIENTS_ENV) else {
+        return registry;
+    };
+    let path = PathBuf::from(path);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "mcp-lockd: cannot read {CLIENTS_ENV} ({}): {e}",
+                path.display()
+            );
+            return registry;
+        }
+    };
+    let map: std::collections::BTreeMap<String, String> = match serde_json::from_slice(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("mcp-lockd: {CLIENTS_ENV} is not valid JSON: {e}");
+            return registry;
+        }
+    };
+    for (id, hex) in map {
+        match decode_pubkey(&hex) {
+            Some(key) => {
+                if registry.register(&id, &key).is_err() {
+                    eprintln!("mcp-lockd: client '{id}' has an invalid public key; skipped");
+                }
+            }
+            None => eprintln!("mcp-lockd: client '{id}' public key is not 32-byte hex; skipped"),
+        }
+    }
+    registry
+}
+
+fn decode_pubkey(hex: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
+    if hex.len() != PUBLIC_KEY_LEN * 2 {
+        return None;
+    }
+    let mut out = [0u8; PUBLIC_KEY_LEN];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Open the audit log from `MCPLOCK_AUDIT_LOG`, or fall back to in-memory (with a
+/// warning that the tape is not persisted).
+fn load_audit() -> AuditLog {
+    match std::env::var_os(AUDIT_ENV) {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            match AuditLog::to_file(&path) {
+                Ok(log) => {
+                    eprintln!("mcp-lockd: audit log at {}", path.display());
+                    log
+                }
+                Err(e) => {
+                    eprintln!("mcp-lockd: cannot open audit log ({e}); using in-memory");
+                    AuditLog::in_memory()
+                }
+            }
+        }
+        None => {
+            eprintln!("mcp-lockd: {AUDIT_ENV} unset — audit log is in-memory only (not persisted)");
+            AuditLog::in_memory()
         }
     }
 }

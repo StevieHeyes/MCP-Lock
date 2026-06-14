@@ -22,3 +22,8 @@ serde_json = "1"
 [lib]
 name = "mcp_lockd"
 path = "src/lib.rs"
+
+[dev-dependencies]
+# For the elevation round-trip test: an in-process signer standing in for the
+# client's presence-unlocked key.
+ed25519-dalek = "2"
