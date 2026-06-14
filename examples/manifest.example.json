@@ -1,0 +1,22 @@
+{
+  "servers": [
+    {
+      "id": "mail",
+      "command": "mcp-lock-mail",
+      "args": [],
+      "env": {
+        "MAIL_IMAP_HOST": "imap.example.com",
+        "MAIL_IMAP_USERNAME": "you@example.com",
+        "MAIL_DEFAULT_MAILBOX": "INBOX"
+      },
+      "tools": {
+        "search": "read",
+        "list_messages": "read",
+        "fetch_message": "read",
+        "send_message": "confirm",
+        "delete_message": "confirm",
+        "move_message": "write"
+      }
+    }
+  ]
+}
