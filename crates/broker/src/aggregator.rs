@@ -20,12 +20,23 @@ use serde_json::{json, Value};
 
 use mcp_lock_core::broker::{BrokerState, ServerSlot};
 use mcp_lock_core::manifest::{LoadedManifest, ServerManifest};
-use mcp_lock_core::policy::{classify_advertised, ServerState, Timestamp};
+use mcp_lock_core::policy::{classify_advertised, ClassifiedTool, ServerState, Timestamp};
 
 use crate::mcp_client::{ChildError, McpChild};
 
 /// Separator between server id and tool name in an aggregated tool name.
 pub const NAMESPACE_SEP: char = '.';
+
+/// A function that spawns a child for a given server. Stored so a stopped server
+/// can be re-spawned by [`Aggregator::start`].
+type Spawner = Box<dyn FnMut(&ServerManifest) -> Result<Box<dyn McpChild>, ChildError> + Send>;
+
+/// A freshly spawned child plus its classified tools and raw tool definitions.
+type SpawnedServer = (
+    Box<dyn McpChild>,
+    Vec<ClassifiedTool>,
+    BTreeMap<String, Value>,
+);
 
 /// Errors from aggregator operations.
 #[derive(Debug)]
@@ -33,6 +44,8 @@ pub enum AggregatorError {
     /// A manifest server id contains the namespace separator, which would make
     /// routing ambiguous.
     InvalidServerId(String),
+    /// No server with the given id exists in the manifest.
+    UnknownServer(String),
     /// The requested external tool name does not resolve to a known tool.
     UnknownTool(String),
     /// The tool exists but is not currently exposed (gated by policy).
@@ -47,6 +60,7 @@ impl fmt::Display for AggregatorError {
             AggregatorError::InvalidServerId(id) => {
                 write!(f, "server id '{id}' must not contain '{NAMESPACE_SEP}'")
             }
+            AggregatorError::UnknownServer(id) => write!(f, "unknown server: {id}"),
             AggregatorError::UnknownTool(name) => write!(f, "unknown tool: {name}"),
             AggregatorError::NotExposed(name) => {
                 write!(f, "tool not currently exposed: {name}")
@@ -71,6 +85,10 @@ fn stopped_slot(server: &ServerManifest, advertised: &[String]) -> ServerSlot {
 
 /// The broker's aggregated view over its supervised children.
 pub struct Aggregator {
+    /// The manifest, retained so a stopped server can be re-spawned.
+    manifest: LoadedManifest,
+    /// How to spawn a child, retained for [`Aggregator::start`].
+    spawner: Spawner,
     state: BrokerState,
     children: BTreeMap<String, Box<dyn McpChild>>,
     /// server id -> (tool name -> full tool definition from the child).
@@ -93,10 +111,11 @@ impl Aggregator {
     /// while tests pass in-process fakes. For each server we obtain the child,
     /// list its tools, classify them against the manifest (default-deny), and
     /// build a cold-start (read-only, zero-elevation) slot.
-    pub fn build<F>(loaded: &LoadedManifest, mut spawn: F) -> Result<Self, AggregatorError>
+    pub fn build<F>(loaded: &LoadedManifest, spawn: F) -> Result<Self, AggregatorError>
     where
-        F: FnMut(&ServerManifest) -> Result<Box<dyn McpChild>, ChildError>,
+        F: FnMut(&ServerManifest) -> Result<Box<dyn McpChild>, ChildError> + Send + 'static,
     {
+        let mut spawner: Spawner = Box::new(spawn);
         let mut children: BTreeMap<String, Box<dyn McpChild>> = BTreeMap::new();
         let mut tool_defs: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
         let mut slots: Vec<ServerSlot> = Vec::new();
@@ -107,61 +126,90 @@ impl Aggregator {
                 // so the operator fixes it, rather than silently degrading.
                 return Err(AggregatorError::InvalidServerId(server.id.clone()));
             }
-
-            // Spawn, then discover the child's tools. A single child failing
-            // either step must not take down the whole broker: we degrade that
-            // one server to a `Stopped` (fail-closed, exposes nothing) slot and
-            // keep going, so a healthy server still comes up. The slot still
-            // gets tools classified — against an empty advertised list when
-            // discovery failed — so it exists but exposes nothing.
-            let mut child = match spawn(server) {
-                Ok(child) => child,
-                Err(e) => {
-                    eprintln!(
-                        "mcp-lockd: server '{}' failed to spawn ({e}); starting it stopped \
-                         (no tools exposed)",
-                        server.id
-                    );
-                    slots.push(stopped_slot(server, &[]));
-                    tool_defs.insert(server.id.clone(), BTreeMap::new());
-                    continue;
-                }
-            };
-
-            let advertised_defs = match child.list_tools() {
-                Ok(defs) => defs,
-                Err(e) => {
-                    eprintln!(
-                        "mcp-lockd: server '{}' failed to list tools ({e}); starting it stopped \
-                         (no tools exposed)",
-                        server.id
-                    );
-                    slots.push(stopped_slot(server, &[]));
-                    tool_defs.insert(server.id.clone(), BTreeMap::new());
-                    // Keep the child so a later restart/reap can observe it.
+            // A single child failing to spawn or list tools must not take down
+            // the whole broker: degrade that one server to a `Stopped`
+            // (fail-closed, exposes nothing) slot and keep going, so a healthy
+            // server still comes up. A later `start` can respawn it via the
+            // retained spawner. (An `InvalidServerId` above is different: that's
+            // a manifest defect the operator must fix, so it fails the build.)
+            match spawn_and_classify(&mut spawner, server) {
+                Ok((child, classified, defs)) => {
+                    slots.push(ServerSlot::new_running(server.id.clone(), classified));
+                    tool_defs.insert(server.id.clone(), defs);
                     children.insert(server.id.clone(), child);
-                    continue;
                 }
-            };
-
-            let advertised_names: Vec<String> =
-                advertised_defs.iter().map(|t| t.name.clone()).collect();
-            let classified = classify_advertised(&server.tools, &advertised_names);
-            slots.push(ServerSlot::new_running(server.id.clone(), classified));
-
-            let defs: BTreeMap<String, Value> = advertised_defs
-                .into_iter()
-                .map(|t| (t.name, t.definition))
-                .collect();
-            tool_defs.insert(server.id.clone(), defs);
-            children.insert(server.id.clone(), child);
+                Err(AggregatorError::Child(e)) => {
+                    eprintln!(
+                        "mcp-lockd: server '{}' failed to start ({e}); starting it stopped \
+                         (no tools exposed)",
+                        server.id
+                    );
+                    slots.push(stopped_slot(server, &[]));
+                    tool_defs.insert(server.id.clone(), BTreeMap::new());
+                }
+                Err(other) => return Err(other),
+            }
         }
 
         Ok(Aggregator {
+            manifest: loaded.clone(),
+            spawner,
             state: BrokerState::cold_start(slots),
             children,
             tool_defs,
         })
+    }
+
+    /// Pause a server: routing-level only (the process keeps running, so resume
+    /// is instant). Exposes nothing while paused. Returns the unknown-server
+    /// error if `id` is not in the manifest.
+    pub fn pause(&mut self, id: &str) -> Result<(), AggregatorError> {
+        self.set_state(id, ServerState::Paused)
+    }
+
+    /// Resume a paused server, re-exposing its (policy-gated) tools.
+    pub fn resume(&mut self, id: &str) -> Result<(), AggregatorError> {
+        self.set_state(id, ServerState::Running)
+    }
+
+    /// Stop a server: mark it stopped (exposes nothing) and terminate its child
+    /// process (the child is dropped, which kills it). Idempotent.
+    pub fn stop(&mut self, id: &str) -> Result<(), AggregatorError> {
+        self.set_state(id, ServerState::Stopped)?;
+        // Dropping the child handle terminates the process (see StdioMcpClient::drop).
+        self.children.remove(id);
+        Ok(())
+    }
+
+    /// Start (or restart) a server: spawn it if no child is running, re-discover
+    /// and re-classify its tools, and set it Running. Brings a server up
+    /// read-only — never elevated.
+    pub fn start(&mut self, id: &str) -> Result<(), AggregatorError> {
+        let server = self
+            .manifest
+            .manifest
+            .server(id)
+            .cloned()
+            .ok_or_else(|| AggregatorError::UnknownServer(id.to_string()))?;
+
+        if !self.children.contains_key(id) {
+            let (child, classified, defs) = spawn_and_classify(&mut self.spawner, &server)?;
+            self.children.insert(id.to_string(), child);
+            self.tool_defs.insert(id.to_string(), defs);
+            if let Some(slot) = self.state.server_mut(id) {
+                slot.set_tools(classified);
+            }
+        }
+        self.set_state(id, ServerState::Running)
+    }
+
+    fn set_state(&mut self, id: &str, state: ServerState) -> Result<(), AggregatorError> {
+        let slot = self
+            .state
+            .server_mut(id)
+            .ok_or_else(|| AggregatorError::UnknownServer(id.to_string()))?;
+        slot.set_state(state);
+        Ok(())
     }
 
     /// The MCP `tools/list` payload at `now`: every currently-exposed tool,
@@ -271,6 +319,23 @@ impl Aggregator {
     pub fn exposure_snapshot(&self, now: Timestamp) -> BTreeMap<String, Vec<String>> {
         self.state.exposure_snapshot(now)
     }
+}
+
+/// Spawn a child for `server`, list its tools, and classify them against the
+/// manifest (default-deny). Shared by build and start.
+fn spawn_and_classify(
+    spawner: &mut Spawner,
+    server: &ServerManifest,
+) -> Result<SpawnedServer, AggregatorError> {
+    let mut child = spawner(server).map_err(AggregatorError::Child)?;
+    let advertised_defs = child.list_tools().map_err(AggregatorError::Child)?;
+    let advertised_names: Vec<String> = advertised_defs.iter().map(|t| t.name.clone()).collect();
+    let classified = classify_advertised(&server.tools, &advertised_names);
+    let defs: BTreeMap<String, Value> = advertised_defs
+        .into_iter()
+        .map(|t| (t.name, t.definition))
+        .collect();
+    Ok((child, classified, defs))
 }
 
 #[cfg(test)]
@@ -569,5 +634,47 @@ mod tests {
             Ok(Box::new(FakeChild::with_tools(&[])) as Box<dyn McpChild>)
         });
         assert!(matches!(result, Err(AggregatorError::InvalidServerId(_))));
+    }
+
+    #[test]
+    fn pause_hides_tools_and_resume_restores() {
+        let mut agg = build_with_fake();
+        assert!(!agg.aggregated_tools(0).is_empty());
+        agg.pause("mail").unwrap();
+        assert!(agg.aggregated_tools(0).is_empty(), "paused exposes nothing");
+        agg.resume("mail").unwrap();
+        assert_eq!(
+            names(&agg.aggregated_tools(0)),
+            vec!["mail.fetch_message", "mail.search"]
+        );
+    }
+
+    #[test]
+    fn stop_then_start_respawns_read_only() {
+        let mut agg = build_with_fake();
+        agg.stop("mail").unwrap();
+        assert!(
+            agg.aggregated_tools(0).is_empty(),
+            "stopped exposes nothing"
+        );
+        // start re-spawns via the retained spawner and comes up read-only.
+        agg.start("mail").unwrap();
+        assert_eq!(
+            names(&agg.aggregated_tools(0)),
+            vec!["mail.fetch_message", "mail.search"]
+        );
+    }
+
+    #[test]
+    fn lifecycle_on_unknown_server_errors() {
+        let mut agg = build_with_fake();
+        assert!(matches!(
+            agg.pause("nope"),
+            Err(AggregatorError::UnknownServer(_))
+        ));
+        assert!(matches!(
+            agg.start("nope"),
+            Err(AggregatorError::UnknownServer(_))
+        ));
     }
 }

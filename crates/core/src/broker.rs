@@ -49,6 +49,13 @@ impl ServerSlot {
         &self.tools
     }
 
+    /// Replace the classified tool set. Used when a server is (re)started and
+    /// its advertised tools are re-discovered and re-classified. Does not change
+    /// state or elevation.
+    pub fn set_tools(&mut self, tools: Vec<ClassifiedTool>) {
+        self.tools = tools;
+    }
+
     /// The current lifecycle state.
     pub fn state(&self) -> ServerState {
         self.state

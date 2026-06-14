@@ -17,9 +17,11 @@ use mcp_lock_core::auth::StaticBearerValidator;
 use mcp_lock_core::broker::BrokerState;
 use mcp_lock_core::exec::ExecutionContext;
 use mcp_lock_core::manifest::{self, ServerManifest};
+use mcp_lock_transport::control::{self, ControlHandler, ControlServer};
 use mcp_lock_transport::endpoint::{HttpEndpoint, Notifier};
 
 use mcp_lockd::aggregator::Aggregator;
+use mcp_lockd::control_handler::BrokerControlHandler;
 use mcp_lockd::handler::BrokerMcpHandler;
 use mcp_lockd::mcp_client::{ChildError, McpChild, StdioMcpClient};
 
@@ -107,16 +109,26 @@ fn serve(path: PathBuf) -> ExitCode {
         }
     };
 
-    let handler = Arc::new(BrokerMcpHandler::new(Arc::new(Mutex::new(aggregator))));
+    // Share the aggregator and the notifier between the MCP endpoint and the
+    // control channel, so a lifecycle change on the control channel fires
+    // tools/list_changed to MCP clients.
+    let aggregator = Arc::new(Mutex::new(aggregator));
+    let notifier = Notifier::new();
+
+    let mcp_handler = Arc::new(BrokerMcpHandler::new(aggregator.clone()));
     let listen = std::env::var(LISTEN_ENV).unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
-    let endpoint = match HttpEndpoint::bind(&listen, Arc::new(validator), handler, Notifier::new())
-    {
-        Ok(ep) => ep,
-        Err(e) => {
-            eprintln!("mcp-lockd: could not bind {listen}: {e}");
-            return ExitCode::from(1);
-        }
-    };
+    let endpoint =
+        match HttpEndpoint::bind(&listen, Arc::new(validator), mcp_handler, notifier.clone()) {
+            Ok(ep) => ep,
+            Err(e) => {
+                eprintln!("mcp-lockd: could not bind {listen}: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+    // Start the local control channel (observe + lifecycle). A failure here is
+    // non-fatal: the MCP endpoint still serves read-only.
+    start_control_channel(aggregator, notifier);
 
     eprintln!(
         "mcp-lockd: MCP endpoint listening on http://{} (read-only until elevated)",
@@ -124,6 +136,22 @@ fn serve(path: PathBuf) -> ExitCode {
     );
     endpoint.run();
     ExitCode::SUCCESS
+}
+
+/// Bind the control socket and serve it on a background thread.
+fn start_control_channel(aggregator: Arc<Mutex<Aggregator>>, notifier: Notifier) {
+    let path = control::socket_path();
+    let handler: Arc<dyn ControlHandler> =
+        Arc::new(BrokerControlHandler::new(aggregator, notifier));
+    match ControlServer::bind(&path) {
+        Ok(server) => {
+            eprintln!("mcp-lockd: control socket at {}", path.display());
+            std::thread::spawn(move || server.run(handler));
+        }
+        Err(e) => {
+            eprintln!("mcp-lockd: warning: control channel unavailable ({e})");
+        }
+    }
 }
 
 /// Spawn one child server under the v1 execution context (first-party, no
