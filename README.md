@@ -1,5 +1,7 @@
 # MCP-Lock
 
+⚠️ **Work in Progress** — This project is in active development. The API, feature set, and configuration format are not yet stable. Use at your own risk.
+
 A local control plane for managing MCP servers on one host. See what is running,
 start/stop/pause servers, and grant write access on demand: time-boxed, gated by
 human presence, default read-only, fail-closed.
