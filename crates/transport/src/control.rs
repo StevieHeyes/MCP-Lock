@@ -73,6 +73,50 @@ pub enum ControlRequest {
         /// Server id.
         id: String,
     },
+    /// Step 1 of elevation: request a single-use nonce for a write window.
+    RequestElevation {
+        /// Registered client id.
+        client_id: String,
+        /// Server to elevate.
+        server_id: String,
+        /// `"duration"` or `"until_revoked"`.
+        mode: String,
+        /// Window length for `duration` mode.
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+    },
+    /// Step 2 of elevation: submit the signed assertion that consumes the nonce.
+    SubmitElevation {
+        /// Registered client id.
+        client_id: String,
+        /// Hex nonce from `RequestElevation`.
+        nonce: String,
+        /// Hex Ed25519 signature over the challenge.
+        signature: String,
+    },
+    /// Step 1 of per-action confirm: request a nonce for one `confirm` tool.
+    RequestConfirm {
+        /// Registered client id.
+        client_id: String,
+        /// Server the tool belongs to.
+        server_id: String,
+        /// The tool to confirm.
+        tool: String,
+    },
+    /// Step 2 of per-action confirm: submit the signed assertion.
+    SubmitConfirm {
+        /// Registered client id.
+        client_id: String,
+        /// Hex nonce from `RequestConfirm`.
+        nonce: String,
+        /// Hex Ed25519 signature over the challenge.
+        signature: String,
+    },
+    /// Revoke any active elevation on a server (back to read-only).
+    Revoke {
+        /// Server id.
+        id: String,
+    },
 }
 
 /// One server's status line.
@@ -107,7 +151,12 @@ pub enum ControlResponse {
         /// Recent log lines, most recent last.
         entries: Vec<String>,
     },
-    /// Reply to a lifecycle command.
+    /// Reply carrying a single-use nonce (hex) to sign.
+    Nonce {
+        /// Hex-encoded nonce.
+        nonce: String,
+    },
+    /// Reply to a lifecycle/elevation command.
     Done {
         /// Human-readable confirmation.
         message: String,
