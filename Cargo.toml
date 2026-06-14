@@ -5,6 +5,7 @@ members = [
     "crates/transport",
     "crates/broker",
     "crates/cli",
+    "crates/mail",
 ]
 
 # Shared metadata and dependency versions for every crate in the workspace.
