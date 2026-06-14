@@ -8,14 +8,29 @@
 //!
 //! With no arguments it still reports its fail-closed posture and exits.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
+use mcp_lock_core::auth::StaticBearerValidator;
 use mcp_lock_core::broker::BrokerState;
 use mcp_lock_core::exec::ExecutionContext;
-use mcp_lock_core::manifest;
+use mcp_lock_core::manifest::{self, ServerManifest};
+use mcp_lock_transport::endpoint::{HttpEndpoint, Notifier};
+
+use mcp_lockd::aggregator::Aggregator;
+use mcp_lockd::handler::BrokerMcpHandler;
+use mcp_lockd::mcp_client::{ChildError, McpChild, StdioMcpClient};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Env var the bearer token for the MCP endpoint is read from. Ship-closed: if
+/// unset/empty, `serve` refuses to start.
+const TOKEN_ENV: &str = "MCPLOCK_BEARER_TOKEN";
+/// Env var for the listen address. Defaults to loopback.
+const LISTEN_ENV: &str = "MCPLOCK_LISTEN";
+const DEFAULT_LISTEN: &str = "127.0.0.1:8765";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -35,6 +50,19 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("serve") => match args.get(1).map(String::as_str) {
+            Some("--manifest") => match args.get(2) {
+                Some(path) => serve(PathBuf::from(path)),
+                None => {
+                    eprintln!("mcp-lockd: serve --manifest requires a path");
+                    ExitCode::from(2)
+                }
+            },
+            _ => {
+                eprintln!("mcp-lockd: usage: serve --manifest <path>");
+                ExitCode::from(2)
+            }
+        },
         None => {
             print_posture();
             ExitCode::SUCCESS
@@ -45,6 +73,66 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Spawn the manifest's servers and serve the aggregated, fail-closed MCP
+/// endpoint over HTTP on loopback. Blocks until killed.
+fn serve(path: PathBuf) -> ExitCode {
+    let loaded = match manifest::load_from_path(&path) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("mcp-lockd: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    eprintln!(
+        "mcp-lockd {VERSION}: manifest {} ({})",
+        path.display(),
+        loaded.integrity_sha256
+    );
+
+    // Ship closed: no token, no endpoint.
+    let token = std::env::var(TOKEN_ENV).unwrap_or_default();
+    let Some(validator) = StaticBearerValidator::new(&token, "mcp-client") else {
+        eprintln!("mcp-lockd: refusing to start — set {TOKEN_ENV} to a non-empty bearer token");
+        return ExitCode::from(1);
+    };
+
+    // Spawn and supervise the child servers (broker is the parent).
+    let aggregator = match Aggregator::build(&loaded, spawn_child) {
+        Ok(agg) => agg,
+        Err(e) => {
+            eprintln!("mcp-lockd: failed to start servers: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let handler = Arc::new(BrokerMcpHandler::new(Arc::new(Mutex::new(aggregator))));
+    let listen = std::env::var(LISTEN_ENV).unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
+    let endpoint = match HttpEndpoint::bind(&listen, Arc::new(validator), handler, Notifier::new())
+    {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("mcp-lockd: could not bind {listen}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    eprintln!(
+        "mcp-lockd: MCP endpoint listening on http://{} (read-only until elevated)",
+        endpoint.local_addr()
+    );
+    endpoint.run();
+    ExitCode::SUCCESS
+}
+
+/// Spawn one child server under the v1 execution context (first-party, no
+/// sandbox), passing the manifest's non-secret env.
+fn spawn_child(server: &ServerManifest) -> Result<Box<dyn McpChild>, ChildError> {
+    let ctx = ExecutionContext::first_party(Vec::new());
+    let env: BTreeMap<String, String> = server.env.clone();
+    StdioMcpClient::spawn(&server.command, &server.args, &ctx, &env)
+        .map(|c| Box::new(c) as Box<dyn McpChild>)
 }
 
 /// Load a manifest read-only and print its integrity hash and the cold-start
@@ -97,7 +185,14 @@ fn print_help() {
     println!("mcp-lockd {VERSION} — MCP-Lock broker daemon");
     println!();
     println!("USAGE:");
-    println!("    mcp-lockd [--check-manifest <path>]");
+    println!("    mcp-lockd serve --manifest <path>");
+    println!("    mcp-lockd --check-manifest <path>");
+    println!();
+    println!("COMMANDS:");
+    println!("    serve --manifest <path>   Spawn the manifest's servers and serve the");
+    println!("                              aggregated MCP endpoint over HTTP (loopback).");
+    println!("                              Requires {TOKEN_ENV}; binds {LISTEN_ENV}");
+    println!("                              (default {DEFAULT_LISTEN}).");
     println!();
     println!("FLAGS:");
     println!("    --check-manifest <path>   Load a manifest read-only; print its");
@@ -105,6 +200,5 @@ fn print_help() {
     println!("    -h, --help                Print this help");
     println!("    -V, --version             Print version");
     println!();
-    println!("The aggregator/endpoint (Slice 3) and control channel (Slice 5) are not");
-    println!("yet implemented; this binary opens no listeners.");
+    println!("The control channel and presence-gated elevation arrive in Slice 5.");
 }

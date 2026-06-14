@@ -12,9 +12,12 @@
 //!   them (operator-authoritative, default-deny), exposes only what policy
 //!   currently allows, and routes calls — re-checking the gate at call time.
 //!
-//! The upward MCP endpoint (HTTP/SSE + the bearer-token seam) is wired on top of
-//! this in Slice 3c. Everything here is synchronous; transport/async complexity
-//! stays at the edge.
+//! * [`handler`] — [`handler::BrokerMcpHandler`] implements the transport
+//!   crate's `McpHandler`, answering MCP requests from the aggregator. The HTTP
+//!   endpoint itself (bearer-auth'd, in `mcp-lock-transport`) calls into it.
+//!
+//! Everything here is synchronous; transport/async complexity stays at the edge.
 
 pub mod aggregator;
+pub mod handler;
 pub mod mcp_client;
