@@ -1,0 +1,49 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "mcp-lockd: --check-manifest (example)",
+      "cargo": {
+        "args": ["build", "--bin=mcp-lockd", "--package=mcp-lockd"],
+        "filter": { "name": "mcp-lockd", "kind": "bin" }
+      },
+      "args": ["--check-manifest", "examples/manifest.example.json"],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "mcp-lock-mail: --fake (stdio demo)",
+      "cargo": {
+        "args": ["build", "--bin=mcp-lock-mail", "--package=mcp-lock-mail"],
+        "filter": { "name": "mcp-lock-mail", "kind": "bin" }
+      },
+      "args": ["--fake"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "mcp-lock: --help",
+      "cargo": {
+        "args": ["build", "--bin=mcp-lock", "--package=mcp-lock"],
+        "filter": { "name": "mcp-lock", "kind": "bin" }
+      },
+      "args": ["--help"],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in mcp-lock-core",
+      "cargo": {
+        "args": ["test", "--no-run", "--lib", "--package=mcp-lock-core"],
+        "filter": { "name": "mcp-lock-core", "kind": "lib" }
+      },
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

@@ -18,5 +18,11 @@
 .DS_Store
 *.swp
 .idea/
-.vscode/
 .worktrees/
+
+# VS Code: commit the shared project config, ignore user-specific/local files.
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json

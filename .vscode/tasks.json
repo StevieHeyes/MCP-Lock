@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build (workspace)",
+      "type": "shell",
+      "command": "cargo build --workspace",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "test (workspace)",
+      "type": "shell",
+      "command": "cargo test --workspace --all-features",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "clippy (deny warnings)",
+      "type": "shell",
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "fmt (check)",
+      "type": "shell",
+      "command": "cargo fmt --all -- --check",
+      "problemMatcher": []
+    },
+    {
+      "label": "fmt (write)",
+      "type": "shell",
+      "command": "cargo fmt --all",
+      "problemMatcher": []
+    },
+    {
+      "label": "CI (local: fmt + clippy + test)",
+      "detail": "Runs the same gates as the GitHub Actions CI, in order.",
+      "dependsOrder": "sequence",
+      "dependsOn": ["fmt (check)", "clippy (deny warnings)", "test (workspace)"],
+      "problemMatcher": []
+    }
+  ]
+}
