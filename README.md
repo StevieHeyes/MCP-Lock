@@ -96,10 +96,8 @@ answers `--help`/`--version` only. They become functional in later slices.
 
 ## Usage
 
-<!-- TODO(agent): extend as later slices land. Still to cover: running the broker
-and registering the mail server via manifest (Slice 3); the CLI observe/lifecycle
-commands (Slice 4); and the elevation flow (Slice 5). Keep examples accurate to
-shipped behaviour only. -->
+<!-- TODO(agent): extend when Slice 5 lands — the presence-gated elevation flow.
+Keep examples accurate to shipped behaviour only. -->
 
 ### Read-only mail server, standalone (Slice 1)
 
@@ -142,6 +140,48 @@ The server opens mailboxes read-only (IMAP `EXAMINE`) and fetches with
 `BODY.PEEK`, so it never marks messages read or alters mailbox state. It exposes
 no tool that can send, move, flag, or delete mail — by design (see
 [SECURITY.md](SECURITY.md) on the data-plane / prompt-injection surface).
+
+### Running the broker (Slice 3)
+
+The broker (`mcp-lockd`) supervises servers declared in a manifest and presents a
+single, fail-closed, bearer-authenticated MCP endpoint. See
+[`examples/manifest.example.json`](examples/manifest.example.json) for the format;
+each server's tools are classified `read`, `write`, or `confirm`
+(operator-authoritative — a child cannot widen its own surface).
+
+Inspect a manifest without starting anything (prints the integrity hash and the
+read-only cold-start exposure):
+
+    mcp-lockd --check-manifest examples/manifest.example.json
+
+Serve the aggregated endpoint. It **ships closed**: it refuses to start without a
+bearer token.
+
+    export MCPLOCK_BEARER_TOKEN=...          # required; no default token
+    # optional: MCPLOCK_LISTEN (default 127.0.0.1:8765)
+    mcp-lockd serve --manifest /path/to/manifest.json
+
+Point an MCP client at `http://127.0.0.1:8765/` with an
+`Authorization: Bearer <token>` header. In the default (un-elevated) state only
+read tools are offered; tool names are namespaced `server.tool` (e.g.
+`mail.search`).
+
+### Controlling the broker with the CLI (Slice 4)
+
+`mcp-lock` talks to a running broker over a local Unix socket
+(`$MCPLOCK_CONTROL_SOCK`, or a default under the temp dir) to observe and drive
+lifecycle. Lifecycle requires no presence — the worst a terminal attacker can do
+is deny service, never escalate.
+
+    mcp-lock status            # servers, state, exposed tool count
+    mcp-lock list              # currently exposed (namespaced) tools
+    mcp-lock logs [N]          # recent broker log lines
+    mcp-lock pause <id>        # stop exposing/routing a server (instant resume)
+    mcp-lock resume <id>
+    mcp-lock stop <id>         # terminate a server
+    mcp-lock start <id>        # (re)start a server, read-only
+
+Presence-gated write elevation arrives in Slice 5.
 
 ## Contributing
 
