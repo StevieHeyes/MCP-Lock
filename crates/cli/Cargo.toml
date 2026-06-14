@@ -17,3 +17,8 @@ workspace = true
 # client live in the transport crate.
 [dependencies]
 mcp-lock-transport = { path = "../transport" }
+mcp-lock-core = { path = "../core" }
+# Signs elevation/confirm challenges with a dev signing key (MCPLOCK_SIGNING_KEY).
+# This is the source-built / pre-Keychain path; presence-gated Keychain/Secure
+# Enclave signing is a documented follow-up.
+ed25519-dalek = "2"
