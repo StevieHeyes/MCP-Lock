@@ -1,0 +1,18 @@
+[package]
+name = "mcp-lock"
+description = "MCP-Lock control CLI: observe and lifecycle over the control channel. Scaffolding in Slice 0; commands land in Slice 4."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# An argument parser (e.g. clap) will be added in Slice 4 when real subcommands
+# exist, and justified there. Slice 0 parses the two trivial flags by hand to
+# stay dependency-free.
+[dependencies]

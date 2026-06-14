@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Cargo lock is committed for the workspace (this repo produces binaries, not a
+# published library), so it is intentionally NOT ignored.
+
+# Local environment / secrets — never commit. MCP-Lock takes credentials only
+# from the environment or the platform key store; nothing secret belongs here.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.keychain
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
