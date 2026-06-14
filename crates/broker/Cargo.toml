@@ -15,3 +15,10 @@ workspace = true
 [dependencies]
 mcp-lock-core = { path = "../core" }
 mcp-lock-transport = { path = "../transport" }
+# JSON-RPC framing for talking to child stdio MCP servers and aggregating their
+# tools. Same well-audited choice used elsewhere in the workspace.
+serde_json = "1"
+
+[lib]
+name = "mcp_lockd"
+path = "src/lib.rs"

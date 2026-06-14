@@ -447,6 +447,7 @@ version = "0.0.0"
 dependencies = [
  "mcp-lock-core",
  "mcp-lock-transport",
+ "serde_json",
 ]
 
 [[package]]
