@@ -39,6 +39,12 @@ pub const NONCE_LEN: usize = 32;
 /// How long an issued-but-unused nonce remains valid (seconds). Short, because
 /// the client signs and returns it immediately.
 pub const NONCE_TTL_SECS: u64 = 60;
+/// Upper bound on outstanding (issued-but-unconsumed) nonces. Pruning removes
+/// expired entries, but within the TTL window a caller could otherwise issue
+/// without bound; this caps the store so a flood of `issue` calls cannot grow
+/// memory unboundedly. Reaching it means rejecting new issues until the
+/// outstanding ones are consumed or expire (fail closed).
+pub const MAX_PENDING_NONCES: usize = 1024;
 /// Length of an Ed25519 public key, in bytes.
 pub const PUBLIC_KEY_LEN: usize = 32;
 
@@ -143,6 +149,9 @@ pub enum ElevationError {
     Rng,
     /// The nonce is unknown, already used, or for a different client.
     UnknownOrUsedNonce,
+    /// Too many nonces are outstanding; refuse to issue more until some are
+    /// consumed or expire.
+    TooManyPending,
     /// The nonce expired before it was used.
     NonceExpired,
     /// No registered key for this client.
@@ -158,6 +167,7 @@ impl fmt::Display for ElevationError {
         let s = match self {
             ElevationError::Rng => "random number generation failed",
             ElevationError::UnknownOrUsedNonce => "unknown or already-used nonce",
+            ElevationError::TooManyPending => "too many outstanding nonces",
             ElevationError::NonceExpired => "nonce expired",
             ElevationError::UnknownClient => "unknown client",
             ElevationError::Malformed => "malformed key or signature",
@@ -301,6 +311,9 @@ impl NonceStore {
         now: Timestamp,
     ) -> Result<Nonce, ElevationError> {
         self.prune(now);
+        if self.pending.len() >= MAX_PENDING_NONCES {
+            return Err(ElevationError::TooManyPending);
+        }
         let nonce = Nonce::generate()?;
         self.pending.push(Pending {
             nonce,
@@ -434,6 +447,24 @@ mod tests {
             other => panic!("expected elevation, got {other:?}"),
         }
         assert_eq!(store.pending_count(), 0, "nonce consumed");
+    }
+
+    #[test]
+    fn issue_is_bounded_against_a_flood() {
+        let (mut store, _registry, _signer) = setup();
+        // Fill to the cap at a fixed time (so nothing prunes), then the next
+        // issue is refused rather than growing without bound.
+        for _ in 0..MAX_PENDING_NONCES {
+            store.issue("client-1", elevate_purpose(), 0).unwrap();
+        }
+        assert_eq!(store.pending_count(), MAX_PENDING_NONCES);
+        assert!(matches!(
+            store.issue("client-1", elevate_purpose(), 0),
+            Err(ElevationError::TooManyPending)
+        ));
+        // Once the outstanding nonces expire, issuing works again.
+        let later = NONCE_TTL_SECS + 1;
+        assert!(store.issue("client-1", elevate_purpose(), later).is_ok());
     }
 
     #[test]

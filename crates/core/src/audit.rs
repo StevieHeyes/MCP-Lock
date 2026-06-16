@@ -53,6 +53,20 @@ pub enum AuditEvent {
         /// Tool name.
         tool: String,
     },
+    /// An elevation or confirmation attempt was rejected. These are the
+    /// high-signal events for incident review — a forged signature, an unknown
+    /// client, an expired nonce, or a replay — so the tape must record them, not
+    /// only the successes. The `reason` is the coarse, attacker-safe
+    /// `ElevationError` text (no signature/nonce material). The broker records
+    /// this on every failed verification (wired where verification is invoked).
+    ElevationDenied {
+        /// Server the attempt targeted.
+        server_id: String,
+        /// Client that attempted it (as presented; unverified).
+        client_id: String,
+        /// Coarse reason (e.g. "bad signature", "unknown or used nonce").
+        reason: String,
+    },
 }
 
 /// An append-only audit sink: a file plus an in-memory ring of recent lines.
@@ -179,6 +193,21 @@ mod tests {
         assert!(contents.contains("delete_message"));
         assert_eq!(contents.lines().count(), 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn records_denied_attempts_for_incident_review() {
+        let log = AuditLog::in_memory();
+        log.record(AuditEvent::ElevationDenied {
+            server_id: "mail".into(),
+            client_id: "attacker".into(),
+            reason: "bad signature".into(),
+        });
+        let recent = log.recent(10);
+        assert_eq!(recent.len(), 1);
+        assert!(recent[0].contains("elevation_denied"));
+        assert!(recent[0].contains("bad signature"));
+        assert!(recent[0].contains("attacker"));
     }
 
     #[test]
