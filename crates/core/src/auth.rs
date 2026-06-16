@@ -114,6 +114,29 @@ impl StaticBearerValidator {
     }
 }
 
+// Best-effort scrub of the configured token from memory when the validator is
+// dropped. This is defense in depth, not a hard guarantee: the OS may already
+// have paged or copied the bytes elsewhere. It deliberately uses only safe Rust
+// (the crate denies `unsafe_code`) and adds no dependency (the crate keeps its
+// dep set minimal and auditable).
+impl Drop for StaticBearerValidator {
+    fn drop(&mut self) {
+        scrub(&mut self.expected);
+    }
+}
+
+/// Overwrite `buf` with zeros, resisting dead-store elimination.
+///
+/// A plain zeroing loop on a value about to be freed can be optimized away as a
+/// dead store. `black_box` forces the compiler to treat the zeroed buffer as
+/// observed, so the writes are kept — all in safe Rust.
+fn scrub(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    std::hint::black_box(buf);
+}
+
 impl CredentialValidator for StaticBearerValidator {
     fn validate(&self, presented_token: Option<&str>) -> Result<ValidatedClient, AuthError> {
         let presented = presented_token.ok_or(AuthError::Missing)?;
@@ -149,6 +172,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_zeroes_the_buffer() {
+        let mut buf = b"s3cr3t-placeholder".to_vec();
+        scrub(&mut buf);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
 
     #[test]
     fn accepts_the_configured_token() {
