@@ -19,8 +19,21 @@
 
 use std::io::{self, Read};
 use std::net::SocketAddr;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// How often an idle SSE stream emits a keep-alive comment. This is what lets a
+/// silently-disconnected client be noticed: the keep-alive write fails once the
+/// socket is gone, tiny_http drops the response, the `SseReader` (and its
+/// `Receiver`) is dropped, and the next [`Notifier::notify`] prunes the dead
+/// `Sender`. Without a periodic write a parked reader would never be reaped.
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Upper bound on a POST request body. Loopback single-user in v1, but an
+/// unbounded `read_to_string` is a memory-DoS vector if the listen address is
+/// ever widened, so the bound is established here.
+const MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
 
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -93,22 +106,32 @@ impl Notifier {
 
 /// A `Read` that turns broadcast notification strings into an SSE byte stream.
 ///
-/// It blocks until the next notification arrives, then yields one `data: …\n\n`
-/// frame. When the sender side is dropped it returns EOF, ending the response.
+/// It waits up to [`SSE_KEEPALIVE_INTERVAL`] for the next notification, then
+/// yields one `data: …\n\n` frame. On idle timeout it yields a `: keepalive`
+/// comment instead — that periodic write is what surfaces a disconnected client
+/// (the write fails, the response is dropped, the reader is dropped, and the
+/// next broadcast prunes the now-dead sender). When the sender side is dropped
+/// it returns EOF, ending the response.
 struct SseReader {
     rx: Receiver<String>,
     buf: Vec<u8>,
     pos: usize,
+    keepalive: Duration,
 }
 
 impl SseReader {
     fn new(rx: Receiver<String>) -> Self {
+        Self::with_keepalive(rx, SSE_KEEPALIVE_INTERVAL)
+    }
+
+    fn with_keepalive(rx: Receiver<String>, keepalive: Duration) -> Self {
         // An initial SSE comment so the stream (and its headers) is established
         // immediately, before any real event.
         SseReader {
             rx,
             buf: b": connected\n\n".to_vec(),
             pos: 0,
+            keepalive,
         }
     }
 }
@@ -116,13 +139,19 @@ impl SseReader {
 impl Read for SseReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.pos >= self.buf.len() {
-            match self.rx.recv() {
+            match self.rx.recv_timeout(self.keepalive) {
                 Ok(message) => {
                     self.buf = format!("data: {message}\n\n").into_bytes();
                     self.pos = 0;
                 }
+                // Idle: emit a keep-alive comment so a dead socket is detected
+                // on the write rather than parking this reader forever.
+                Err(RecvTimeoutError::Timeout) => {
+                    self.buf = b": keepalive\n\n".to_vec();
+                    self.pos = 0;
+                }
                 // Sender dropped: end the stream.
-                Err(_) => return Ok(0),
+                Err(RecvTimeoutError::Disconnected) => return Ok(0),
             }
         }
         let n = out.len().min(self.buf.len() - self.pos);
@@ -249,8 +278,14 @@ fn handle_request(
 }
 
 fn handle_post(mut request: Request, handler: &dyn McpHandler, client: &ValidatedClient) {
+    // Bound the body so a hostile/oversized request can't exhaust memory.
     let mut body = String::new();
-    if request.as_reader().read_to_string(&mut body).is_err() {
+    if request
+        .as_reader()
+        .take(MAX_BODY_BYTES)
+        .read_to_string(&mut body)
+        .is_err()
+    {
         let _ = request.respond(json_response(parse_error_body(), 400));
         return;
     }
@@ -262,6 +297,13 @@ fn handle_post(mut request: Request, handler: &dyn McpHandler, client: &Validate
             return;
         }
     };
+
+    // Batched requests (a top-level JSON array) are not supported; reject them
+    // explicitly as invalid rather than silently treating them as a notification.
+    if parsed.is_array() {
+        let _ = request.respond(json_response(invalid_request_body(), 400));
+        return;
+    }
 
     // A notification (no id) is accepted but not answered with a JSON-RPC body.
     if parsed.get("id").is_none() {
@@ -289,6 +331,11 @@ fn handle_sse(request: Request, notifier: &Notifier) {
 
 fn parse_error_body() -> String {
     json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}).to_string()
+}
+
+fn invalid_request_body() -> String {
+    json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid request"}})
+        .to_string()
 }
 
 fn internal_error_body() -> String {
@@ -325,5 +372,22 @@ mod tests {
         reader.read_to_string(&mut out).unwrap();
         assert!(out.starts_with(": connected\n\n"));
         assert!(out.contains("data: hello\n\n"));
+    }
+
+    #[test]
+    fn sse_reader_emits_keepalive_when_idle() {
+        // With a short keep-alive and no events, an idle read yields a comment
+        // frame (the periodic write that lets a dead socket be detected) rather
+        // than blocking forever.
+        let (tx, rx) = channel::<String>();
+        let mut reader = SseReader::with_keepalive(rx, Duration::from_millis(20));
+        let mut buf = [0u8; 64];
+        // Drain the initial ": connected" frame.
+        let _ = reader.read(&mut buf).unwrap();
+        // Next read blocks only for the keep-alive interval, then returns a comment.
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b": keepalive\n\n");
+        // Keep tx alive until here so the channel isn't disconnected.
+        drop(tx);
     }
 }

@@ -151,6 +151,9 @@ mod tests {
         fn call_tool(&mut self, name: &str, _args: Value) -> Result<Value, ChildError> {
             Ok(json!({"content":[{"type":"text","text":format!("ran {name}")}],"isError":false}))
         }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
     }
 
     const MANIFEST: &[u8] = br#"{"servers":[{"id":"mail","command":"x","tools":{"search":"read","delete_message":"write"}}]}"#;

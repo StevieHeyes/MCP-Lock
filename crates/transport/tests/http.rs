@@ -121,6 +121,22 @@ fn accepts_authenticated_request_and_dispatches_to_handler() {
 }
 
 #[test]
+fn batched_request_array_is_rejected_as_invalid() {
+    let addr = start_endpoint();
+    // A top-level JSON array (JSON-RPC batch) is unsupported and must be
+    // rejected explicitly, not silently treated as a notification.
+    let (status, body) = http_request(
+        addr,
+        "POST",
+        Some(TOKEN),
+        r#"[{"jsonrpc":"2.0","id":1,"method":"a"},{"jsonrpc":"2.0","id":2,"method":"b"}]"#,
+    );
+    assert_eq!(status, 400);
+    let parsed: Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(parsed["error"]["code"], -32600);
+}
+
+#[test]
 fn notification_is_accepted_without_body() {
     let addr = start_endpoint();
     // No "id" => notification => 202, no JSON-RPC body.
