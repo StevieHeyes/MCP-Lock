@@ -62,6 +62,15 @@ impl ImapBackend {
         mailbox: &str,
         op: impl FnOnce(&mut ImapSession) -> Result<T, MailError>,
     ) -> Result<T, MailError> {
+        // Defence-in-depth: reject control characters (CR, LF, NUL) in the
+        // mailbox name before it reaches `examine`, mirroring the CRLF stripping
+        // `build_text_search` does for search queries. `examine` is read-only,
+        // but refusing injection-shaped names is the right hygiene.
+        if mailbox.contains(['\r', '\n', '\0']) {
+            return Err(MailError::MailboxUnavailable {
+                mailbox: mailbox.to_string(),
+            });
+        }
         let mut session = self.connect()?;
         // EXAMINE = read-only open. A failure here is treated as the mailbox
         // being unavailable.
@@ -115,7 +124,12 @@ impl MailStore for ImapBackend {
         })
     }
 
-    fn search(&self, mailbox: &str, query: &str) -> Result<Vec<MessageSummary>, MailError> {
+    fn search(
+        &self,
+        mailbox: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageSummary>, MailError> {
         let criterion = build_text_search(query);
         self.with_mailbox(mailbox, |session| {
             let mut uids: Vec<u32> = session
@@ -124,7 +138,12 @@ impl MailStore for ImapBackend {
                 .into_iter()
                 .collect();
             uids.sort_unstable();
+            // Newest (highest UID) first.
             uids.reverse();
+            // Cap before fetching, exactly as `list_messages` does: a broad
+            // query on a huge mailbox must not pull the whole mailbox or build a
+            // giant UID-set fetch command.
+            uids.truncate(limit);
             Self::fetch_summaries(session, &uids)
         })
     }
@@ -219,7 +238,9 @@ fn summary_from_fetch(fetch: &Fetch) -> Option<MessageSummary> {
 }
 
 fn message_from_fetch(uid: u32, fetch: &Fetch) -> Message {
-    let body_bytes = fetch.body().or_else(|| fetch.text()).unwrap_or(&[]);
+    // The fetch requests `BODY.PEEK[]`, surfaced by `.body()`. `.text()`
+    // (BODY[TEXT]) is never populated by this fetch, so there is no fallback.
+    let body_bytes = fetch.body().unwrap_or(&[]);
     match MessageParser::default().parse(body_bytes) {
         Some(m) => Message {
             uid,

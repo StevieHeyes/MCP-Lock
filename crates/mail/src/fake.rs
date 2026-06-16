@@ -132,12 +132,17 @@ impl MailStore for FakeMailStore {
             .collect())
     }
 
-    fn search(&self, mailbox: &str, query: &str) -> Result<Vec<MessageSummary>, MailError> {
+    fn search(
+        &self,
+        mailbox: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageSummary>, MailError> {
         let mb = self.mailbox(mailbox)?;
         let needle = query.to_lowercase();
         // Case-insensitive substring match over subject, from, and body, newest
-        // first. The real IMAP backend defers matching to the server; this is a
-        // deterministic stand-in for tests and the demo.
+        // first, capped at `limit`. The real IMAP backend defers matching to the
+        // server; this is a deterministic stand-in for tests and the demo.
         Ok(mb
             .messages
             .iter()
@@ -147,6 +152,7 @@ impl MailStore for FakeMailStore {
                     || s.message.from.to_lowercase().contains(&needle)
                     || s.message.body_text.to_lowercase().contains(&needle)
             })
+            .take(limit)
             .map(summary_of)
             .collect())
     }
@@ -177,9 +183,12 @@ mod tests {
     #[test]
     fn search_matches_subject_from_and_body_case_insensitively() {
         let store = FakeMailStore::demo();
-        assert_eq!(store.search("INBOX", "lunch").unwrap().len(), 1);
-        assert_eq!(store.search("INBOX", "ATTACKER").unwrap().len(), 1);
-        assert!(store.search("INBOX", "no-such-text").unwrap().is_empty());
+        assert_eq!(store.search("INBOX", "lunch", 200).unwrap().len(), 1);
+        assert_eq!(store.search("INBOX", "ATTACKER", 200).unwrap().len(), 1);
+        assert!(store
+            .search("INBOX", "no-such-text", 200)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

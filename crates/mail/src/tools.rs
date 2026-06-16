@@ -53,6 +53,12 @@ pub fn tool_definitions() -> Vec<Value> {
                     "mailbox": {
                         "type": "string",
                         "description": "Mailbox to search. Defaults to the configured default mailbox (usually INBOX)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_LIST_LIMIT,
+                        "description": "Maximum number of matches to return. Defaults to 200."
                     }
                 },
                 "required": ["query"]
@@ -132,7 +138,10 @@ fn call_search<S: MailStore>(
     let args = require_object(arguments)?;
     let query = require_string(args, "query")?;
     let mailbox = optional_mailbox(args, default_mailbox)?;
-    Ok(summaries_to_result(store.search(&mailbox, &query)))
+    // Search has no narrowing default the way `list_messages` does; an absent
+    // limit means "as many as allowed", i.e. the hard cap.
+    let limit = optional_limit(args, MAX_LIST_LIMIT)?;
+    Ok(summaries_to_result(store.search(&mailbox, &query, limit)))
 }
 
 fn call_list<S: MailStore>(
@@ -147,7 +156,7 @@ fn call_list<S: MailStore>(
         .as_object()
         .ok_or_else(|| ToolError::new("`arguments` must be an object"))?;
     let mailbox = optional_mailbox(args, default_mailbox)?;
-    let limit = optional_limit(args)?;
+    let limit = optional_limit(args, DEFAULT_LIST_LIMIT)?;
     Ok(summaries_to_result(store.list_messages(&mailbox, limit)))
 }
 
@@ -206,9 +215,12 @@ fn optional_mailbox(
     }
 }
 
-fn optional_limit(args: &serde_json::Map<String, Value>) -> Result<usize, ToolError> {
+fn optional_limit(
+    args: &serde_json::Map<String, Value>,
+    default: usize,
+) -> Result<usize, ToolError> {
     match args.get("limit") {
-        None | Some(Value::Null) => Ok(DEFAULT_LIST_LIMIT),
+        None | Some(Value::Null) => Ok(default),
         Some(Value::Number(n)) => {
             let v = n
                 .as_u64()
@@ -273,4 +285,100 @@ fn ok_text(text: String) -> Value {
 
 fn error_text(text: String) -> Value {
     json!({ "content": [ { "type": "text", "text": text } ], "isError": true })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake::FakeMailStore;
+    use crate::mailstore::Message;
+
+    /// Parse the `count` field out of a successful summaries result.
+    fn result_count(result: &Value) -> u64 {
+        assert_eq!(result["isError"], json!(false), "expected a success result");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        parsed["count"].as_u64().unwrap()
+    }
+
+    /// A store whose INBOX holds `n` messages with UIDs `1..=n`, all matching the
+    /// search needle "match".
+    fn store_with(n: u32) -> FakeMailStore {
+        let mut store = FakeMailStore::new();
+        for uid in 1..=n {
+            store.add_message(
+                "INBOX",
+                Message {
+                    uid,
+                    subject: "match".to_string(),
+                    from: "a@example.test".to_string(),
+                    to: "b@example.test".to_string(),
+                    date: String::new(),
+                    body_text: "match".to_string(),
+                },
+                false,
+            );
+        }
+        store
+    }
+
+    #[test]
+    fn list_limit_over_max_is_clamped_to_max() {
+        let store = store_with((MAX_LIST_LIMIT as u32) + 50);
+        let args = json!({ "limit": MAX_LIST_LIMIT + 50 });
+        let result = call(&store, "list_messages", Some(&args), "INBOX").unwrap();
+        assert_eq!(result_count(&result), MAX_LIST_LIMIT as u64);
+    }
+
+    #[test]
+    fn list_limit_zero_is_rejected() {
+        let store = FakeMailStore::demo();
+        let args = json!({ "limit": 0 });
+        let err = call(&store, "list_messages", Some(&args), "INBOX").unwrap_err();
+        assert!(err.message.contains("at least 1"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn search_limit_over_max_is_clamped_to_max() {
+        let store = store_with((MAX_LIST_LIMIT as u32) + 50);
+        let args = json!({ "query": "match", "limit": MAX_LIST_LIMIT + 50 });
+        let result = call(&store, "search", Some(&args), "INBOX").unwrap();
+        assert_eq!(result_count(&result), MAX_LIST_LIMIT as u64);
+    }
+
+    #[test]
+    fn search_caps_results_at_max_when_limit_absent() {
+        // More matches than the hard cap, no explicit limit: must truncate to
+        // MAX_LIST_LIMIT, not return the whole mailbox.
+        let store = store_with((MAX_LIST_LIMIT as u32) + 50);
+        let args = json!({ "query": "match" });
+        let result = call(&store, "search", Some(&args), "INBOX").unwrap();
+        assert_eq!(result_count(&result), MAX_LIST_LIMIT as u64);
+    }
+
+    #[test]
+    fn require_uid_rejects_zero_negative_and_overflow() {
+        let store = FakeMailStore::demo();
+        // uid 0 (below minimum)
+        let zero = json!({ "uid": 0 });
+        assert!(call(&store, "fetch_message", Some(&zero), "INBOX").is_err());
+        // negative uid
+        let neg = json!({ "uid": -1 });
+        assert!(call(&store, "fetch_message", Some(&neg), "INBOX").is_err());
+        // overflow beyond u32::MAX
+        let over = json!({ "uid": (u64::from(u32::MAX)) + 1 });
+        assert!(call(&store, "fetch_message", Some(&over), "INBOX").is_err());
+        // a valid in-range uid is accepted (no InvalidParams error)
+        let ok = json!({ "uid": 1 });
+        assert!(call(&store, "fetch_message", Some(&ok), "INBOX").is_ok());
+    }
+
+    #[test]
+    fn require_uid_accepts_u32_max_boundary() {
+        let store = FakeMailStore::demo();
+        let max = json!({ "uid": u32::MAX });
+        // In range, so it is a valid param; the message simply is not found,
+        // which surfaces as a tool-level result, not an InvalidParams error.
+        assert!(call(&store, "fetch_message", Some(&max), "INBOX").is_ok());
+    }
 }

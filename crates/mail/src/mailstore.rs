@@ -60,6 +60,13 @@ pub enum MailError {
         uid: u32,
     },
     /// The search query was not understood by the backend.
+    ///
+    /// Reserved for future query-validation. The current backends do not
+    /// construct it: the IMAP backend sanitises free text into an always-valid
+    /// `TEXT "..."` criterion (so the server never rejects it as malformed) and
+    /// reports any `SEARCH` failure as a transport-level [`MailError::Backend`],
+    /// which cannot be cleanly distinguished from a bad criterion. It is part of
+    /// the public, `#[non_exhaustive]` error surface for richer query grammars.
     InvalidQuery {
         /// Human-readable reason. Never contains credentials.
         reason: String,
@@ -98,10 +105,15 @@ pub trait MailStore {
     /// first.
     fn list_messages(&self, mailbox: &str, limit: usize) -> Result<Vec<MessageSummary>, MailError>;
 
-    /// Search `mailbox` and return matching message summaries, newest first.
-    /// The query grammar is backend-defined; the IMAP backend maps it to an
-    /// IMAP `SEARCH`.
-    fn search(&self, mailbox: &str, query: &str) -> Result<Vec<MessageSummary>, MailError>;
+    /// Search `mailbox` and return up to `limit` matching message summaries,
+    /// newest first. The query grammar is backend-defined; the IMAP backend maps
+    /// it to an IMAP `SEARCH`.
+    fn search(
+        &self,
+        mailbox: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageSummary>, MailError>;
 
     /// Fetch the full message with `uid` from `mailbox`.
     fn fetch_message(&self, mailbox: &str, uid: u32) -> Result<Message, MailError>;
