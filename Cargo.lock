@@ -434,6 +434,9 @@ dependencies = [
 [[package]]
 name = "mcp-lock"
 version = "0.0.0"
+dependencies = [
+ "mcp-lock-transport",
+]
 
 [[package]]
 name = "mcp-lock-core"

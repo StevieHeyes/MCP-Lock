@@ -18,7 +18,7 @@
 #![cfg(unix)]
 
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,12 +28,14 @@ use serde::{Deserialize, Serialize};
 /// Environment variable overriding the control-socket path.
 pub const SOCKET_ENV: &str = "MCPLOCK_CONTROL_SOCK";
 
-/// The control-socket path: `$MCPLOCK_CONTROL_SOCK`, or `<tmpdir>/mcp-lock.sock`.
-/// Both the broker (to bind) and the CLI (to connect) call this, so they agree.
+/// The control-socket path: `$MCPLOCK_CONTROL_SOCK`, or
+/// `<tmpdir>/mcp-lock/control.sock`. Both the broker (to bind) and the CLI (to
+/// connect) call this, so they agree. The default nests the socket in its own
+/// directory so [`ControlServer::bind`] can make that directory owner-only.
 pub fn socket_path() -> PathBuf {
     std::env::var_os(SOCKET_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("mcp-lock.sock"))
+        .unwrap_or_else(|| std::env::temp_dir().join("mcp-lock").join("control.sock"))
 }
 
 /// A control request from the CLI to the broker.
@@ -140,7 +142,16 @@ impl ControlClient {
 
         let mut reader = BufReader::new(stream);
         let mut response_line = String::new();
-        reader.read_line(&mut response_line)?;
+        // A clean EOF here (0 bytes) means the broker accepted the connection
+        // but closed it without writing a response — report that accurately
+        // rather than letting an empty string surface as a confusing JSON parse
+        // error that reads like "broker unreachable".
+        if reader.read_line(&mut response_line)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "broker closed the control connection without a response",
+            ));
+        }
         serde_json::from_str(&response_line).map_err(io::Error::other)
     }
 }
@@ -155,6 +166,19 @@ impl ControlServer {
     /// Bind the control socket at `path`, replacing any stale socket file, and
     /// restrict it to owner-only (`0600`).
     pub fn bind(path: &Path) -> io::Result<Self> {
+        // Create the socket's parent directory owner-only first. `UnixListener::bind`
+        // creates the socket with `0777 & !umask`, leaving a brief window before the
+        // `set_permissions` below during which a colocated user could connect. A
+        // `0700` parent closes that window without needing `umask` (which would be
+        // unsafe/libc, forbidden here). `DirBuilder` applies the mode only to
+        // directories it creates, so an existing shared dir (e.g. the temp dir) is
+        // never relaxed or tightened.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
         // Remove a stale socket from a previous run; ignore if absent.
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
@@ -273,5 +297,44 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("control request never succeeded");
+    }
+
+    #[test]
+    fn bind_makes_the_socket_parent_owner_only() {
+        let dir = std::env::temp_dir().join(format!("mcp-lock-test-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("control.sock");
+        let _server = ControlServer::bind(&path).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "the socket's parent dir is owner-only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn request_reports_eof_when_broker_closes_without_responding() {
+        // A listener that accepts a connection and immediately drops it (closing
+        // the socket) without writing a response. The client must surface a
+        // clear UnexpectedEof, not a misleading parse/"unreachable" error.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mcp-lock-test-eof-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                // Read (consume) the request so the client's write succeeds,
+                // then close without writing a response — the broker accepted
+                // but produced nothing, which the client must report as EOF.
+                let mut line = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut line);
+                drop(stream);
+            }
+        });
+
+        let err = ControlClient::request(&path, &ControlRequest::List)
+            .expect_err("a connection closed without a response must be an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }

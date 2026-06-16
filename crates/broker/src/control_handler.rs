@@ -216,6 +216,9 @@ mod tests {
         fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value, ChildError> {
             Ok(json!({}))
         }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
     }
 
     const MANIFEST: &[u8] =
