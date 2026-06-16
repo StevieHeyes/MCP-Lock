@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use mcp_lock_core::broker::{BrokerState, ServerSlot};
 use mcp_lock_core::manifest::{LoadedManifest, ServerManifest};
-use mcp_lock_core::policy::{classify_advertised, Timestamp};
+use mcp_lock_core::policy::{classify_advertised, ServerState, Timestamp};
 
 use crate::mcp_client::{ChildError, McpChild};
 
@@ -58,6 +58,17 @@ impl fmt::Display for AggregatorError {
 
 impl std::error::Error for AggregatorError {}
 
+/// Build a fail-closed (`Stopped`) slot for `server`, classifying its declared
+/// tools against `advertised`. Used when a child can't spawn or list tools at
+/// build time: the slot exists (so lifecycle/restart can act on it) but exposes
+/// nothing while it is `Stopped`.
+fn stopped_slot(server: &ServerManifest, advertised: &[String]) -> ServerSlot {
+    let classified = classify_advertised(&server.tools, advertised);
+    let mut slot = ServerSlot::new_running(server.id.clone(), classified);
+    slot.set_state(ServerState::Stopped);
+    slot
+}
+
 /// The broker's aggregated view over its supervised children.
 pub struct Aggregator {
     state: BrokerState,
@@ -92,11 +103,46 @@ impl Aggregator {
 
         for server in &loaded.manifest.servers {
             if server.id.contains(NAMESPACE_SEP) {
+                // A manifest defect, not a runtime fault: fail the whole build
+                // so the operator fixes it, rather than silently degrading.
                 return Err(AggregatorError::InvalidServerId(server.id.clone()));
             }
 
-            let mut child = spawn(server).map_err(AggregatorError::Child)?;
-            let advertised_defs = child.list_tools().map_err(AggregatorError::Child)?;
+            // Spawn, then discover the child's tools. A single child failing
+            // either step must not take down the whole broker: we degrade that
+            // one server to a `Stopped` (fail-closed, exposes nothing) slot and
+            // keep going, so a healthy server still comes up. The slot still
+            // gets tools classified — against an empty advertised list when
+            // discovery failed — so it exists but exposes nothing.
+            let mut child = match spawn(server) {
+                Ok(child) => child,
+                Err(e) => {
+                    eprintln!(
+                        "mcp-lockd: server '{}' failed to spawn ({e}); starting it stopped \
+                         (no tools exposed)",
+                        server.id
+                    );
+                    slots.push(stopped_slot(server, &[]));
+                    tool_defs.insert(server.id.clone(), BTreeMap::new());
+                    continue;
+                }
+            };
+
+            let advertised_defs = match child.list_tools() {
+                Ok(defs) => defs,
+                Err(e) => {
+                    eprintln!(
+                        "mcp-lockd: server '{}' failed to list tools ({e}); starting it stopped \
+                         (no tools exposed)",
+                        server.id
+                    );
+                    slots.push(stopped_slot(server, &[]));
+                    tool_defs.insert(server.id.clone(), BTreeMap::new());
+                    // Keep the child so a later restart/reap can observe it.
+                    children.insert(server.id.clone(), child);
+                    continue;
+                }
+            };
 
             let advertised_names: Vec<String> =
                 advertised_defs.iter().map(|t| t.name.clone()).collect();
@@ -170,9 +216,43 @@ impl Aggregator {
             .children
             .get_mut(server_id)
             .ok_or_else(|| AggregatorError::UnknownTool(external_name.to_string()))?;
-        child
-            .call_tool(tool, arguments)
-            .map_err(AggregatorError::Child)
+        match child.call_tool(tool, arguments) {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                // A crashed (`Exited`/`Io`) or hung (`Timeout`) child must fail
+                // closed immediately: stop exposing its tools and drop any
+                // elevation BEFORE the error propagates, so the very next
+                // listing reflects the fault. An `Rpc`/`Protocol` error is the
+                // child answering — it stays up.
+                if matches!(
+                    e,
+                    ChildError::Exited | ChildError::Io(_) | ChildError::Timeout
+                ) {
+                    if let Some(slot) = self.state.server_mut(server_id) {
+                        slot.set_state(ServerState::Stopped);
+                        slot.fail_closed();
+                    }
+                }
+                Err(AggregatorError::Child(e))
+            }
+        }
+    }
+
+    /// Fail closed any child that has died since we last looked. A supervising
+    /// handler calls this before computing the exposed listing so a child that
+    /// crashed between calls has its tools dropped and its elevation revoked.
+    ///
+    /// For each child, if it is not alive, its slot is moved to `Stopped` and
+    /// `fail_closed()`; live children are left untouched. Idempotent.
+    pub fn reap_exited_children(&mut self) {
+        for (id, child) in self.children.iter_mut() {
+            if !child.is_alive() {
+                if let Some(slot) = self.state.server_mut(id) {
+                    slot.set_state(ServerState::Stopped);
+                    slot.fail_closed();
+                }
+            }
+        }
     }
 
     /// Shared access to the broker state (read).
@@ -202,8 +282,15 @@ mod tests {
     use crate::mcp_client::ToolDef;
 
     /// An in-process fake child with fixed tools that echoes calls back.
+    ///
+    /// Configurable for the fault paths: `call_error` makes `call_tool` fail
+    /// with a chosen error, and `alive` controls what `is_alive` reports.
     struct FakeChild {
         tools: Vec<ToolDef>,
+        /// If set, `call_tool` returns this error instead of echoing.
+        call_error: Option<ChildError>,
+        /// What `is_alive` reports (children are alive by default).
+        alive: bool,
     }
 
     impl FakeChild {
@@ -215,7 +302,23 @@ mod tests {
                     definition: json!({ "name": n, "description": format!("tool {n}") }),
                 })
                 .collect();
-            FakeChild { tools }
+            FakeChild {
+                tools,
+                call_error: None,
+                alive: true,
+            }
+        }
+
+        /// Make `call_tool` fail with `error`.
+        fn failing(mut self, error: ChildError) -> Self {
+            self.call_error = Some(error);
+            self
+        }
+
+        /// Make `is_alive` report `false` (the child has died).
+        fn dead(mut self) -> Self {
+            self.alive = false;
+            self
         }
     }
 
@@ -224,7 +327,13 @@ mod tests {
             Ok(self.tools.clone())
         }
         fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, ChildError> {
+            if let Some(err) = self.call_error.take() {
+                return Err(err);
+            }
             Ok(json!({ "called": name, "arguments": arguments }))
+        }
+        fn is_alive(&mut self) -> bool {
+            self.alive
         }
     }
 
@@ -342,6 +451,118 @@ mod tests {
 
     #[test]
     fn server_id_with_separator_is_rejected() {
+        let bad = br#"{"servers":[{"id":"a.b","command":"x"}]}"#;
+        let loaded = load_from_bytes(bad).unwrap();
+        let result = Aggregator::build(&loaded, |_| {
+            Ok(Box::new(FakeChild::with_tools(&[])) as Box<dyn McpChild>)
+        });
+        assert!(matches!(result, Err(AggregatorError::InvalidServerId(_))));
+    }
+
+    #[test]
+    fn call_to_crashed_child_fails_the_server_closed() {
+        let loaded = load_from_bytes(MANIFEST).unwrap();
+        let mut agg = Aggregator::build(&loaded, |_server| {
+            Ok(Box::new(
+                FakeChild::with_tools(&["search", "fetch_message", "delete_message"])
+                    .failing(ChildError::Exited),
+            ) as Box<dyn McpChild>)
+        })
+        .unwrap();
+
+        // Elevate, so we can prove the elevation is dropped by the fault.
+        agg.state_mut()
+            .server_mut("mail")
+            .unwrap()
+            .grant_elevation(Elevation::for_duration(0, 300));
+        assert_eq!(agg.state().elevation_count(), 1);
+
+        // The call hits a child that reports `Exited`.
+        let result = agg.call("mail.search", json!({}), 0);
+        assert!(matches!(
+            result,
+            Err(AggregatorError::Child(ChildError::Exited))
+        ));
+
+        // Fail closed: the slot is Stopped, elevation is gone, nothing exposed.
+        let slot = agg.state().server("mail").unwrap();
+        assert_eq!(slot.state(), ServerState::Stopped);
+        assert_eq!(agg.state().elevation_count(), 0);
+        assert!(agg.aggregated_tools(0).is_empty());
+    }
+
+    #[test]
+    fn reap_exited_children_fails_dead_children_closed() {
+        let loaded = load_from_bytes(MANIFEST).unwrap();
+        let mut agg = Aggregator::build(&loaded, |_server| {
+            Ok(
+                Box::new(FakeChild::with_tools(&["search", "fetch_message"]).dead())
+                    as Box<dyn McpChild>,
+            )
+        })
+        .unwrap();
+
+        // Healthy at build time, even though the fake reports not-alive.
+        agg.state_mut()
+            .server_mut("mail")
+            .unwrap()
+            .grant_elevation(Elevation::for_duration(0, 300));
+        assert!(!agg.aggregated_tools(0).is_empty());
+
+        agg.reap_exited_children();
+
+        let slot = agg.state().server("mail").unwrap();
+        assert_eq!(slot.state(), ServerState::Stopped);
+        assert_eq!(agg.state().elevation_count(), 0);
+        assert!(agg.aggregated_tools(0).is_empty());
+    }
+
+    #[test]
+    fn build_degrades_one_failed_spawn_and_keeps_healthy_servers() {
+        // Two servers: `mail` fails to spawn, `cal` comes up healthy.
+        let manifest = br#"{
+            "servers": [
+                {
+                    "id": "mail",
+                    "command": "mcp-lock-mail",
+                    "tools": { "search": "read", "delete_message": "write" }
+                },
+                {
+                    "id": "cal",
+                    "command": "mcp-lock-cal",
+                    "tools": { "list_events": "read", "create_event": "write" }
+                }
+            ]
+        }"#;
+        let loaded = load_from_bytes(manifest).unwrap();
+
+        let agg = Aggregator::build(&loaded, |server| {
+            if server.id == "mail" {
+                // Simulate a child that cannot be launched.
+                Err(ChildError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such binary",
+                )))
+            } else {
+                Ok(
+                    Box::new(FakeChild::with_tools(&["list_events", "create_event"]))
+                        as Box<dyn McpChild>,
+                )
+            }
+        })
+        .expect("a single failed spawn must not abort the whole build");
+
+        // The failed server exists but is Stopped and exposes nothing.
+        let mail = agg.state().server("mail").unwrap();
+        assert_eq!(mail.state(), ServerState::Stopped);
+
+        // The healthy server still exposes its read tools.
+        assert_eq!(names(&agg.aggregated_tools(0)), vec!["cal.list_events"]);
+    }
+
+    #[test]
+    fn build_keeps_invalid_server_id_a_hard_error() {
+        // A manifest defect stays fatal even with the degrade-on-fault change.
         let bad = br#"{"servers":[{"id":"a.b","command":"x"}]}"#;
         let loaded = load_from_bytes(bad).unwrap();
         let result = Aggregator::build(&loaded, |_| {

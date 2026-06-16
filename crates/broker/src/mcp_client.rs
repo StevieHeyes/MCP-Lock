@@ -6,13 +6,24 @@
 //! per child (one request, read until the matching response), which is all the
 //! aggregator needs and keeps the client simple and synchronous.
 //!
+//! Reads happen on a dedicated per-child reader thread that pushes parsed lines
+//! over an [`mpsc`] channel. The request path then blocks on `recv_timeout`, so a
+//! child that hangs (never replies) cannot deadlock the broker: the read times
+//! out and surfaces as [`ChildError::Timeout`]. We use a thread + channel rather
+//! than a non-blocking read because the workspace denies `unsafe_code` and we
+//! must not touch libc/`O_NONBLOCK`; a blocking read on its own thread, abandoned
+//! on timeout, is the safe-std way to bound a read.
+//!
 //! The [`McpChild`] trait is the seam the aggregator depends on, so it can be
 //! driven by an in-process fake in tests without spawning anything.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -20,6 +31,25 @@ use mcp_lock_core::exec::ExecutionContext;
 
 /// MCP protocol version the broker speaks to children.
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Default per-request read timeout. Generous so a legitimately slow tool call
+/// is not cut off, but bounded so a hung child cannot block the broker forever.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Cap on a single newline-delimited message the reader will buffer. A child
+/// (or a corrupted stream) that never emits a newline must not be able to grow
+/// the broker's memory without bound, so the reader fails the line past this
+/// length rather than reading forever.
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long [`Drop`] polls for the killed child to be reaped before giving up.
+/// Bounded so dropping a client can never block the broker indefinitely.
+const DROP_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One item from the reader thread: either a successfully read line, or the IO
+/// error that ended the stream. EOF is signalled by dropping the sender (the
+/// channel disconnects), not by a value.
+type ReadItem = Result<String, std::io::Error>;
 
 /// A tool a child advertises: its name plus the full MCP tool definition
 /// (description, inputSchema) to pass through to the upstream client.
@@ -47,6 +77,9 @@ pub enum ChildError {
     },
     /// The child closed its output / exited.
     Exited,
+    /// The child did not reply within the request timeout (it is hung). The
+    /// broker treats this like a crash: the child fails closed.
+    Timeout,
 }
 
 impl fmt::Display for ChildError {
@@ -58,6 +91,7 @@ impl fmt::Display for ChildError {
                 write!(f, "child returned error {code}: {message}")
             }
             ChildError::Exited => write!(f, "child exited"),
+            ChildError::Timeout => write!(f, "child timed out"),
         }
     }
 }
@@ -72,20 +106,43 @@ pub trait McpChild: Send {
 
     /// Invoke a tool on the child by its (un-namespaced) name.
     fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, ChildError>;
+
+    /// Whether the child process is still alive. A supervising caller uses this
+    /// to fail a crashed child closed (drop its exposure and elevation) before
+    /// recomputing the exposed listing.
+    fn is_alive(&mut self) -> bool;
 }
 
 /// A child MCP server spoken to over stdio. The broker is its parent.
-#[derive(Debug)]
 pub struct StdioMcpClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Lines read from the child's stdout, pushed by the reader thread. EOF on
+    /// stdout disconnects this channel.
+    rx: Receiver<ReadItem>,
+    /// Handle to the reader thread, joined best-effort on drop. Optional only so
+    /// drop can `take()` it.
+    reader: Option<JoinHandle<()>>,
     next_id: u64,
+    /// Per-request read timeout applied to `rx.recv_timeout`.
+    timeout: Duration,
+}
+
+// Hand-written: `Child`/`Receiver`/`JoinHandle` are not all Debug, and we want a
+// compact, non-leaking representation.
+impl fmt::Debug for StdioMcpClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StdioMcpClient")
+            .field("pid", &self.child.id())
+            .field("next_id", &self.next_id)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl StdioMcpClient {
     /// Spawn `command` with `args` and `env`, perform the MCP `initialize`
-    /// handshake, and return a ready client.
+    /// handshake, and return a ready client using [`DEFAULT_REQUEST_TIMEOUT`].
     ///
     /// `ctx` is the execution context the child runs under. In v1 it is always
     /// first-party with no sandbox; v2 attaches per-child isolation and scoped
@@ -97,6 +154,19 @@ impl StdioMcpClient {
         args: &[String],
         ctx: &ExecutionContext,
         env: &BTreeMap<String, String>,
+    ) -> Result<Self, ChildError> {
+        Self::spawn_with_timeout(command, args, ctx, env, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// As [`spawn`](Self::spawn), but with an explicit per-request read timeout.
+    /// Used by tests to drive the timeout path quickly; the public `spawn`
+    /// delegates here with the default.
+    pub fn spawn_with_timeout(
+        command: &str,
+        args: &[String],
+        ctx: &ExecutionContext,
+        env: &BTreeMap<String, String>,
+        timeout: Duration,
     ) -> Result<Self, ChildError> {
         // v1 posture: first-party, broker identity, no sandbox. The context is
         // accepted now so the spawn signature does not change when v2 slots in
@@ -123,11 +193,18 @@ impl StdioMcpClient {
             .take()
             .ok_or_else(|| ChildError::Protocol("child has no stdout".to_string()))?;
 
+        let (tx, rx) = mpsc::channel::<ReadItem>();
+        // The reader owns the stdout half and pushes lines until EOF (sender
+        // dropped on return ⇒ channel disconnects) or the receiver is gone.
+        let reader = thread::spawn(move || read_lines(BufReader::new(stdout), &tx));
+
         let mut client = StdioMcpClient {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            rx,
+            reader: Some(reader),
             next_id: 1,
+            timeout,
         };
         client.initialize()?;
         Ok(client)
@@ -152,12 +229,22 @@ impl StdioMcpClient {
         let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.write_line(&message)?;
 
+        // The timeout is per request, not per line: a child that drips
+        // unrelated notifications must not be able to reset the clock forever.
+        let deadline = Instant::now() + self.timeout;
         loop {
-            let mut line = String::new();
-            let n = self.stdout.read_line(&mut line).map_err(ChildError::Io)?;
-            if n == 0 {
-                return Err(ChildError::Exited);
-            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            let line = match self.rx.recv_timeout(remaining) {
+                Ok(Ok(line)) => line,
+                // Reader surfaced an IO error (incl. the over-length guard).
+                Ok(Err(e)) => return Err(ChildError::Io(e)),
+                // No reply within the budget: the child is hung.
+                Err(RecvTimeoutError::Timeout) => return Err(ChildError::Timeout),
+                // Reader thread gone ⇒ stdout hit EOF ⇒ the child exited.
+                Err(RecvTimeoutError::Disconnected) => return Err(ChildError::Exited),
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -198,6 +285,51 @@ impl StdioMcpClient {
     }
 }
 
+/// Reader-thread body: read newline-delimited messages from `reader` and push
+/// each over `tx` until EOF, a send failure (receiver gone), or an IO/over-length
+/// error. Returns on any of these; returning drops `tx`, which disconnects the
+/// channel and is how the request side learns the child's stdout closed.
+///
+/// We cap each message at [`MAX_LINE_BYTES`] and read byte-bounded chunks rather
+/// than `read_line` into an unbounded `String`, so a child that never emits a
+/// newline cannot grow the broker's memory without bound.
+fn read_lines(mut reader: BufReader<ChildStdout>, tx: &mpsc::Sender<ReadItem>) {
+    loop {
+        let mut buf: Vec<u8> = Vec::new();
+        // `take` bounds this read to one byte past the cap, so an over-length
+        // line stops growing memory; we detect the overflow by hitting the cap
+        // with no newline consumed.
+        let mut limited = (&mut reader).take((MAX_LINE_BYTES as u64) + 1);
+        let n = match limited.read_until(b'\n', &mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                // Best-effort: if the receiver is gone the send fails and we
+                // exit anyway.
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+        if n == 0 {
+            // EOF: drop `tx` by returning, disconnecting the channel.
+            return;
+        }
+        if buf.len() > MAX_LINE_BYTES {
+            let _ = tx.send(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("child message exceeded {MAX_LINE_BYTES} bytes"),
+            )));
+            return;
+        }
+        // Decode lossily so an invalid-UTF-8 byte surfaces downstream as a
+        // protocol (parse) error rather than panicking the reader thread.
+        let line = String::from_utf8_lossy(&buf).into_owned();
+        if tx.send(Ok(line)).is_err() {
+            // Receiver dropped (client gone): nothing more to do.
+            return;
+        }
+    }
+}
+
 impl McpChild for StdioMcpClient {
     fn list_tools(&mut self) -> Result<Vec<ToolDef>, ChildError> {
         let result = self.request("tools/list", json!({}))?;
@@ -223,12 +355,77 @@ impl McpChild for StdioMcpClient {
             json!({ "name": name, "arguments": arguments }),
         )
     }
+
+    fn is_alive(&mut self) -> bool {
+        // `try_wait` does not block. `Ok(None)` means still running; an exit
+        // status or an error (we can't tell ⇒ assume dead) fails closed.
+        matches!(self.child.try_wait(), Ok(None))
+    }
 }
 
 impl Drop for StdioMcpClient {
     fn drop(&mut self) {
-        // The broker owns the child; don't leak it. Best-effort terminate.
+        // The broker owns the child; don't leak it. Best-effort terminate, then
+        // reap with a *bounded* poll loop so a child that ignores the kill (or a
+        // reap that wedges) can never block drop forever.
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let deadline = Instant::now() + DROP_REAP_TIMEOUT;
+        loop {
+            match self.child.try_wait() {
+                // Reaped, or we can't tell — either way stop polling.
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        // Do NOT join the reader thread: if the child ignored the kill, the
+        // reader is still blocked on a read of its stdout and joining would
+        // reintroduce the unbounded wait this method exists to avoid. We detach
+        // it instead — once the OS finally tears the child down, the read hits
+        // EOF and the thread exits on its own.
+        drop(self.reader.take());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A child that reads nothing and never replies must not be able to hang the
+    /// broker: with a short timeout, the very first request (the `initialize`
+    /// handshake inside `spawn_with_timeout`) returns `Timeout` quickly rather
+    /// than blocking forever.
+    #[test]
+    fn hung_child_times_out_quickly() {
+        // `/bin/sleep` ignores its stdin and never writes stdout, so it stands
+        // in for a hung MCP server. A long arg guarantees it outlives the test.
+        let ctx = ExecutionContext::first_party(Vec::new());
+        let env = BTreeMap::new();
+        let timeout = Duration::from_millis(200);
+
+        let start = Instant::now();
+        let result = StdioMcpClient::spawn_with_timeout(
+            "/bin/sleep",
+            &["3600".to_string()],
+            &ctx,
+            &env,
+            timeout,
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(ChildError::Timeout)),
+            "expected Timeout, got {result:?}"
+        );
+        // Must time out promptly — give generous slack for a loaded CI box but
+        // far below the 1h sleep, proving the read was actually bounded.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout took too long: {elapsed:?}"
+        );
     }
 }
