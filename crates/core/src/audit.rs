@@ -53,6 +53,15 @@ pub enum AuditEvent {
         /// Tool name.
         tool: String,
     },
+    /// A `confirm`-class tool was called without a fresh per-action
+    /// confirmation and was refused at the call-time gate. Recorded so repeated
+    /// attempts to invoke a destructive tool without approval are visible.
+    ConfirmRejected {
+        /// Server the tool belongs to.
+        server_id: String,
+        /// Tool that was refused.
+        tool: String,
+    },
     /// An elevation or confirmation attempt was rejected. These are the
     /// high-signal events for incident review — a forged signature, an unknown
     /// client, an expired nonce, or a replay — so the tape must record them, not

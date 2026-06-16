@@ -8,7 +8,6 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use mcp_lock_core::audit::{AuditEvent, AuditLog};
 use mcp_lock_core::elevation::{
@@ -19,6 +18,7 @@ use mcp_lock_transport::control::{ControlHandler, ControlRequest, ControlRespons
 use mcp_lock_transport::endpoint::Notifier;
 
 use crate::aggregator::Aggregator;
+use crate::clock::Clock;
 
 const DEFAULT_LOG_LIMIT: usize = 50;
 const MAX_LOG_ENTRIES: usize = 500;
@@ -33,7 +33,10 @@ pub struct BrokerControlHandler {
     registry: Arc<ClientRegistry>,
     /// The append-only security audit tape.
     audit: Arc<AuditLog>,
-    clock_base: Instant,
+    /// The clock shared with the MCP handler, so timestamps this handler stamps
+    /// into the aggregator (elevation/confirmation) are read back on the same
+    /// epoch.
+    clock: Clock,
     log: Mutex<VecDeque<String>>,
 }
 
@@ -51,6 +54,7 @@ impl BrokerControlHandler {
         notifier: Notifier,
         registry: Arc<ClientRegistry>,
         audit: Arc<AuditLog>,
+        clock: Clock,
     ) -> Self {
         let handler = BrokerControlHandler {
             aggregator,
@@ -58,7 +62,7 @@ impl BrokerControlHandler {
             nonces: Mutex::new(NonceStore::new()),
             registry,
             audit,
-            clock_base: Instant::now(),
+            clock,
             log: Mutex::new(VecDeque::new()),
         };
         handler.record("broker control channel ready");
@@ -66,7 +70,7 @@ impl BrokerControlHandler {
     }
 
     fn now(&self) -> Timestamp {
-        self.clock_base.elapsed().as_secs()
+        self.clock.now()
     }
 
     fn record(&self, message: impl Into<String>) {
@@ -228,8 +232,18 @@ impl BrokerControlHandler {
             }) => self.apply_elevation(client_id, &server_id, elevation, now),
             Ok(Verified::Confirm { server_id, tool }) => self.apply_confirm(&server_id, &tool, now),
             Err(e) => {
-                // A failed verification is security-relevant; record it.
-                self.record(format!("elevation rejected for {client_id}: {e}"));
+                // A failed verification is the highest-signal security event
+                // (forged signature, unknown client, expired nonce, replay), so
+                // it must reach the audit tape, not just the in-memory log. The
+                // server the attempt targeted is not known here — the nonce that
+                // would name it was consumed or never matched — so only the
+                // presented client and the coarse reason are recorded.
+                self.audit.record(AuditEvent::ElevationDenied {
+                    server_id: "(unknown)".to_string(),
+                    client_id: client_id.to_string(),
+                    reason: e.to_string(),
+                });
+                self.record(format!("verification rejected for {client_id}: {e}"));
                 reject(e)
             }
         }
@@ -358,9 +372,10 @@ fn err(message: &str) -> ControlResponse {
 }
 
 /// Map a verification failure to a coarse client-facing error (no oracle on
-/// exactly why beyond what the operator needs).
+/// exactly why beyond what the operator needs). Used for both elevation and
+/// confirm submissions, so the wording stays purpose-neutral.
 fn reject(e: ElevationError) -> ControlResponse {
-    err(&format!("elevation rejected: {e}"))
+    err(&format!("verification rejected: {e}"))
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
@@ -458,6 +473,7 @@ mod tests {
             Notifier::new(),
             Arc::new(registry),
             Arc::new(AuditLog::in_memory()),
+            Clock::new(),
         )
     }
 
@@ -555,6 +571,34 @@ mod tests {
             signature: "00".repeat(64),
         });
         assert!(matches!(resp, ControlResponse::Error { .. }));
+    }
+
+    #[test]
+    fn a_failed_submission_is_recorded_on_the_audit_tape() {
+        // A rejected verification (here: unknown client) must reach the audit
+        // tape, not just the in-memory log — these are the high-signal events.
+        let h = handler();
+        let ControlResponse::Nonce { nonce } = h.handle(ControlRequest::RequestElevation {
+            client_id: "attacker".into(),
+            server_id: "mail".into(),
+            mode: "duration".into(),
+            ttl_secs: Some(300),
+        }) else {
+            panic!("expected a nonce");
+        };
+        let resp = h.handle(ControlRequest::SubmitElevation {
+            client_id: "attacker".into(),
+            nonce,
+            signature: "00".repeat(64),
+        });
+        assert!(matches!(resp, ControlResponse::Error { .. }));
+        assert!(
+            h.audit
+                .recent(10)
+                .iter()
+                .any(|e| e.contains("elevation_denied") && e.contains("attacker")),
+            "the rejected attempt should be on the audit tape"
+        );
     }
 
     #[test]

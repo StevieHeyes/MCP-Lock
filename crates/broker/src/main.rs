@@ -23,6 +23,7 @@ use mcp_lock_transport::control::{self, ControlHandler, ControlServer};
 use mcp_lock_transport::endpoint::{HttpEndpoint, Notifier};
 
 use mcp_lockd::aggregator::Aggregator;
+use mcp_lockd::clock::Clock;
 use mcp_lockd::control_handler::BrokerControlHandler;
 use mcp_lockd::handler::BrokerMcpHandler;
 use mcp_lockd::mcp_client::{ChildError, McpChild, StdioMcpClient};
@@ -130,8 +131,15 @@ fn serve(path: PathBuf) -> ExitCode {
     // to MCP clients and write-tool calls reach the same audit tape.
     let aggregator = Arc::new(Mutex::new(aggregator));
     let notifier = Notifier::new();
+    // One clock for both handlers: they stamp and read elevation/confirmation
+    // times in the shared aggregator, so a single epoch is required.
+    let clock = Clock::new();
 
-    let mcp_handler = Arc::new(BrokerMcpHandler::new(aggregator.clone(), audit.clone()));
+    let mcp_handler = Arc::new(BrokerMcpHandler::new(
+        aggregator.clone(),
+        audit.clone(),
+        clock.clone(),
+    ));
     let listen = std::env::var(LISTEN_ENV).unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
     let endpoint =
         match HttpEndpoint::bind(&listen, Arc::new(validator), mcp_handler, notifier.clone()) {
@@ -144,7 +152,7 @@ fn serve(path: PathBuf) -> ExitCode {
 
     // Start the local control channel (observe + lifecycle + elevation). A
     // failure here is non-fatal: the MCP endpoint still serves read-only.
-    start_control_channel(aggregator, notifier, registry, audit);
+    start_control_channel(aggregator, notifier, registry, audit, clock);
 
     eprintln!(
         "mcp-lockd: MCP endpoint listening on http://{} (read-only until elevated)",
@@ -160,10 +168,11 @@ fn start_control_channel(
     notifier: Notifier,
     registry: Arc<ClientRegistry>,
     audit: Arc<AuditLog>,
+    clock: Clock,
 ) {
     let path = control::socket_path();
     let handler: Arc<dyn ControlHandler> = Arc::new(BrokerControlHandler::new(
-        aggregator, notifier, registry, audit,
+        aggregator, notifier, registry, audit, clock,
     ));
     match ControlServer::bind(&path) {
         Ok(server) => {

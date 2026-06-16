@@ -19,6 +19,7 @@
 //! Everything here is synchronous; transport/async complexity stays at the edge.
 
 pub mod aggregator;
+pub mod clock;
 #[cfg(unix)]
 pub mod control_handler;
 pub mod handler;
