@@ -22,6 +22,57 @@ use std::path::Path;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+// Bounds on a parsed manifest. The manifest is operator-authoritative, so these
+// are not an attack surface today; they bound the blast radius of a malformed or
+// accidentally-huge file (memory, log spam) and make the limits explicit before
+// the spawn path in later slices consumes these fields.
+const MAX_MANIFEST_BYTES: usize = 1 << 20; // 1 MiB
+const MAX_SERVERS: usize = 256;
+const MAX_TOOLS_PER_SERVER: usize = 1024;
+const MAX_ENV_PER_SERVER: usize = 256;
+const MAX_ARGS: usize = 256;
+const MAX_ID_LEN: usize = 128;
+const MAX_NAME_LEN: usize = 128; // tool names
+const MAX_COMMAND_LEN: usize = 4096;
+const MAX_VALUE_LEN: usize = 8192; // args, env values
+const MAX_ENV_KEY_LEN: usize = 256;
+
+/// Reject an environment-variable key that is malformed or could influence the
+/// dynamic loader of the child process spawned in a later slice.
+///
+/// The manifest `env` is the *non-secret* child environment. There is no
+/// legitimate reason for it to carry loader-injection variables, and accepting
+/// them would be a code-injection vector into the child even though the child is
+/// first-party. We also reject keys that are not a well-formed env name (empty,
+/// or containing `=`, NUL, or whitespace/control characters) since those cannot
+/// be passed to `execve` cleanly.
+fn validate_env_key(server_id: &str, key: &str) -> Result<(), ManifestError> {
+    let invalid = |why: &str| {
+        Err(ManifestError::Invalid(format!(
+            "server '{server_id}' env key {key:?} {why}"
+        )))
+    };
+    if key.is_empty() {
+        return invalid("is empty");
+    }
+    if key.len() > MAX_ENV_KEY_LEN {
+        return invalid("is too long");
+    }
+    if key
+        .bytes()
+        .any(|b| b == b'=' || b == 0 || (b as char).is_whitespace() || b.is_ascii_control())
+    {
+        return invalid("contains '=', NUL, whitespace, or a control character");
+    }
+    // Loader-injection variables (Linux `LD_*`, macOS `DYLD_*`). Matched
+    // case-insensitively on the prefix so casing tricks cannot slip through.
+    let upper = key.to_ascii_uppercase();
+    if upper.starts_with("LD_") || upper.starts_with("DYLD_") {
+        return invalid("is a dynamic-loader variable and is not allowed in the manifest");
+    }
+    Ok(())
+}
+
 /// How a single tool is classified. This is the authority that decides whether a
 /// tool is exposed by default or only under elevation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -92,6 +143,11 @@ pub struct Manifest {
 impl Manifest {
     /// Validate structural invariants the type system does not capture.
     fn validate(&self) -> Result<(), ManifestError> {
+        if self.servers.len() > MAX_SERVERS {
+            return Err(ManifestError::Invalid(format!(
+                "too many servers (max {MAX_SERVERS})"
+            )));
+        }
         let mut seen = std::collections::BTreeSet::new();
         for server in &self.servers {
             if server.id.trim().is_empty() {
@@ -99,11 +155,62 @@ impl Manifest {
                     "a server has an empty id".to_string(),
                 ));
             }
+            if server.id.len() > MAX_ID_LEN {
+                return Err(ManifestError::Invalid(format!(
+                    "server id {:?} is too long (max {MAX_ID_LEN})",
+                    server.id
+                )));
+            }
             if server.command.trim().is_empty() {
                 return Err(ManifestError::Invalid(format!(
                     "server '{}' has an empty command",
                     server.id
                 )));
+            }
+            if server.command.len() > MAX_COMMAND_LEN {
+                return Err(ManifestError::Invalid(format!(
+                    "server '{}' command is too long (max {MAX_COMMAND_LEN})",
+                    server.id
+                )));
+            }
+            if server.args.len() > MAX_ARGS {
+                return Err(ManifestError::Invalid(format!(
+                    "server '{}' has too many args (max {MAX_ARGS})",
+                    server.id
+                )));
+            }
+            if server.args.iter().any(|a| a.len() > MAX_VALUE_LEN) {
+                return Err(ManifestError::Invalid(format!(
+                    "server '{}' has an arg that is too long (max {MAX_VALUE_LEN})",
+                    server.id
+                )));
+            }
+            if server.tools.len() > MAX_TOOLS_PER_SERVER {
+                return Err(ManifestError::Invalid(format!(
+                    "server '{}' declares too many tools (max {MAX_TOOLS_PER_SERVER})",
+                    server.id
+                )));
+            }
+            if server.tools.keys().any(|t| t.len() > MAX_NAME_LEN) {
+                return Err(ManifestError::Invalid(format!(
+                    "server '{}' has a tool name that is too long (max {MAX_NAME_LEN})",
+                    server.id
+                )));
+            }
+            if server.env.len() > MAX_ENV_PER_SERVER {
+                return Err(ManifestError::Invalid(format!(
+                    "server '{}' declares too many env vars (max {MAX_ENV_PER_SERVER})",
+                    server.id
+                )));
+            }
+            for (key, value) in &server.env {
+                validate_env_key(&server.id, key)?;
+                if value.len() > MAX_VALUE_LEN {
+                    return Err(ManifestError::Invalid(format!(
+                        "server '{}' env value for {key:?} is too long (max {MAX_VALUE_LEN})",
+                        server.id
+                    )));
+                }
             }
             if !seen.insert(&server.id) {
                 return Err(ManifestError::Invalid(format!(
@@ -167,6 +274,12 @@ impl std::error::Error for ManifestError {
 /// The hash is computed over the exact bytes provided, before parsing, so it
 /// reflects what is on disk byte-for-byte.
 pub fn load_from_bytes(bytes: &[u8]) -> Result<LoadedManifest, ManifestError> {
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(ManifestError::Invalid(format!(
+            "manifest is too large ({} bytes, max {MAX_MANIFEST_BYTES})",
+            bytes.len()
+        )));
+    }
     let integrity_sha256 = sha256_hex(bytes);
     let manifest: Manifest =
         serde_json::from_slice(bytes).map_err(|e| ManifestError::Parse(e.to_string()))?;
@@ -302,6 +415,62 @@ mod tests {
     fn empty_manifest_is_valid() {
         let loaded = load_from_bytes(b"{}").unwrap();
         assert!(loaded.manifest.servers.is_empty());
+    }
+
+    #[test]
+    fn rejects_loader_injection_env_keys() {
+        for key in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "dyld_library_path"] {
+            let bad =
+                format!(r#"{{"servers":[{{"id":"x","command":"a","env":{{"{key}":"/evil"}}}}]}}"#);
+            assert!(
+                matches!(
+                    load_from_bytes(bad.as_bytes()),
+                    Err(ManifestError::Invalid(_))
+                ),
+                "expected {key} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_env_keys() {
+        for key in ["", "HAS=EQUALS", "HAS SPACE"] {
+            let bad =
+                format!(r#"{{"servers":[{{"id":"x","command":"a","env":{{"{key}":"v"}}}}]}}"#);
+            assert!(
+                matches!(
+                    load_from_bytes(bad.as_bytes()),
+                    Err(ManifestError::Invalid(_))
+                ),
+                "expected key {key:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_normal_env_keys() {
+        let ok = r#"{"servers":[{"id":"x","command":"a","env":{"IMAP_HOST":"mail.example.com","RUST_LOG":"info"}}]}"#;
+        assert!(load_from_bytes(ok.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn rejects_overlong_id() {
+        let long_id = "x".repeat(MAX_ID_LEN + 1);
+        let bad = format!(r#"{{"servers":[{{"id":"{long_id}","command":"a"}}]}}"#);
+        assert!(matches!(
+            load_from_bytes(bad.as_bytes()),
+            Err(ManifestError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_manifest() {
+        // A blob larger than the cap is rejected before parsing.
+        let huge = vec![b' '; MAX_MANIFEST_BYTES + 1];
+        assert!(matches!(
+            load_from_bytes(&huge),
+            Err(ManifestError::Invalid(_))
+        ));
     }
 
     #[test]
