@@ -30,13 +30,18 @@
 //!   the unforgeable `ValidatedClient`, and the ship-closed static bearer
 //!   validator).
 //!
-//! Credential handling and presence/nonce verification arrive in the later
-//! security-reviewed slices that fill the remaining seams.
+//! Presence/nonce verification and the audit tape landed in Slice 5:
+//! * [`elevation`] — single-use nonces, the canonical signed challenge, Ed25519
+//!   verification (no replay, binding, freshness, ship-closed), and the client
+//!   registry.
+//! * [`audit`] — the append-only record of elevations and write-tool invocations.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod audit;
 pub mod auth;
 pub mod broker;
+pub mod elevation;
 pub mod error;
 pub mod exec;
 pub mod manifest;

@@ -23,3 +23,11 @@ workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Ed25519 signature *verification* of presence assertions. The broker only ever
+# verifies (the client signs with its presence-unlocked key); `verify_strict` is
+# used to reject malleable signatures. Hand-rolling Ed25519 would be reckless;
+# ed25519-dalek is the well-audited standard.
+ed25519-dalek = "2"
+# Cryptographically secure randomness for single-use elevation nonces. Minimal
+# primitive (already present transitively); avoids pulling the larger `rand`.
+getrandom = "0.3"
