@@ -1,0 +1,41 @@
+[package]
+name = "mcp-lock-mail"
+description = "MCP-Lock read-only IMAP mail MCP server (stdio): search, list_messages, fetch_message. Runs standalone against an MCP client, or as a child of the broker."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# JSON-RPC 2.0 (de)serialization for the MCP stdio protocol. serde + serde_json
+# are the de-facto, widely-audited standard for this in Rust; hand-rolling a
+# JSON parser would be more code and more risk for no benefit.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Synchronous IMAP client for the real backend. Read-only by construction here
+# (mailboxes are opened with EXAMINE, never SELECT). Chosen over a hand-rolled
+# IMAP client because correct IMAP response parsing (literals, envelopes, FETCH)
+# is fiddly and error-prone; this is an edge component, not the security core.
+# The 2.x line is the current stable release (3.x is alpha-only).
+imap = "2.4"
+
+# TLS for the IMAP connection, used to build the connector imap 2.x requires.
+# On macOS (the v1 target) this is Security.framework, so there is no bundled
+# OpenSSL to build or vendor.
+native-tls = "0.2"
+
+# MIME parsing for the real backend: decodes RFC 2047 encoded headers and
+# extracts a readable text/plain body from multipart/encoded messages. Without
+# it, raw MIME source would be returned as the body. Pure Rust, no C deps.
+mail-parser = "0.9"
+
+[[bin]]
+name = "mcp-lock-mail"
+path = "src/main.rs"

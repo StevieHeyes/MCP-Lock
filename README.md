@@ -83,25 +83,65 @@ Build the whole workspace:
 
     cargo build --release
 
-This produces two binaries under `target/release/`:
+This produces these binaries under `target/release/`:
 
-- `mcp-lockd` — the broker daemon.
-- `mcp-lock` — the control CLI.
+- `mcp-lock-mail` — the read-only IMAP mail MCP server (Slice 1; runnable).
+- `mcp-lockd` — the broker daemon (scaffolding).
+- `mcp-lock` — the control CLI (scaffolding).
 
-As of Slice 0 these are scaffolding: `mcp-lockd` starts, reports its fail-closed
-posture, and exits without supervising any servers, and `mcp-lock` answers
-`--help`/`--version` only. The first runnable deliverable (the read-only mail
-server) arrives with Slice 1; see the Usage section as it is filled in.
+As of Slice 1, `mcp-lock-mail` is a working stdio MCP server (see Usage).
+`mcp-lockd` and `mcp-lock` are still scaffolding: `mcp-lockd` starts, reports its
+fail-closed posture, and exits without supervising any servers, and `mcp-lock`
+answers `--help`/`--version` only. They become functional in later slices.
 
 ## Usage
 
-<!-- TODO(agent): complete as slices land. Cover, in order of availability:
-running the read-only mail server standalone (Slice 1); running the broker and
-registering the mail server via manifest (Slice 3); the CLI observe/lifecycle
+<!-- TODO(agent): extend as later slices land. Still to cover: running the broker
+and registering the mail server via manifest (Slice 3); the CLI observe/lifecycle
 commands (Slice 4); and the elevation flow (Slice 5). Keep examples accurate to
 shipped behaviour only. -->
 
-_Not yet available. This section will be completed as the build progresses._
+### Read-only mail server, standalone (Slice 1)
+
+`mcp-lock-mail` is a stdio [MCP](https://modelcontextprotocol.io) server exposing
+three read-only tools — `search`, `list_messages`, and `fetch_message` — over an
+IMAP account. It runs directly against an MCP client without the broker.
+
+**Try it with no account (in-memory demo).** This serves a small built-in
+fixture, so it needs no network and no credentials:
+
+    mcp-lock-mail --fake
+
+**Against a real account.** Credentials come from the environment only; the
+server never prompts for or stores a password. Use an app-specific password where
+your provider supports one.
+
+    export MAIL_IMAP_HOST=imap.example.com
+    export MAIL_IMAP_USERNAME=you@example.com
+    export MAIL_IMAP_PASSWORD=...        # app password; never commit this
+    # optional: MAIL_IMAP_PORT (default 993), MAIL_DEFAULT_MAILBOX (default INBOX)
+    mcp-lock-mail
+
+**Wiring into an MCP client.** Point the client at the binary as a stdio server.
+For example, in a Claude client's MCP config:
+
+    {
+      "mcpServers": {
+        "mail": {
+          "command": "/absolute/path/to/mcp-lock-mail",
+          "env": {
+            "MAIL_IMAP_HOST": "imap.example.com",
+            "MAIL_IMAP_USERNAME": "you@example.com",
+            "MAIL_IMAP_PASSWORD": "..."
+          }
+        }
+      }
+    }
+
+The server opens mailboxes read-only (IMAP `EXAMINE`) and fetches with
+`BODY.PEEK`, so it never marks messages read or alters mailbox state. It exposes
+no tool that can send, move, flag, or delete mail — by design (see
+[SECURITY.md](SECURITY.md) on the data-plane / prompt-injection surface).
 
 ## Contributing
 
