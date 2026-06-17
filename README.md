@@ -96,9 +96,6 @@ answers `--help`/`--version` only. They become functional in later slices.
 
 ## Usage
 
-<!-- TODO(agent): extend when Slice 5 lands — the presence-gated elevation flow.
-Keep examples accurate to shipped behaviour only. -->
-
 ### Read-only mail server, standalone (Slice 1)
 
 `mcp-lock-mail` is a stdio [MCP](https://modelcontextprotocol.io) server exposing
@@ -181,7 +178,41 @@ is deny service, never escalate.
     mcp-lock stop <id>         # terminate a server
     mcp-lock start <id>        # (re)start a server, read-only
 
-Presence-gated write elevation arrives in Slice 5.
+### Write elevation, presence-gated (Slice 5)
+
+Write tools (`write`/`confirm` in the manifest) are exposed only while a server is
+**elevated**, for a bounded window. Elevation is granted by signing a fresh,
+single-use challenge the broker issues — a stolen credential at rest cannot be
+replayed.
+
+Set up signing keys. The broker needs the client's **public** key registered;
+the operator signs with the matching **private** key. v1 signs with a dev key
+(`$MCPLOCK_SIGNING_KEY`, a hex 32-byte seed) under the client id
+`$MCPLOCK_CLIENT_ID` (default `operator`); presence-gated Keychain/Secure-Enclave
+signing is a documented follow-up.
+
+    # Broker side: register the client's public key (ship-closed without this).
+    export MCPLOCK_CLIENTS=/path/to/clients.json   # { "operator": "<hex pubkey>" }
+    export MCPLOCK_AUDIT_LOG=/path/to/audit.log    # append-only tape (else in-memory)
+    mcp-lockd serve --manifest /path/to/manifest.json
+
+    # Operator side:
+    export MCPLOCK_SIGNING_KEY=<hex 32-byte seed>  # dev signer (not presence-gated)
+    mcp-lock elevate mail --ttl 300                # grant write for 300s
+    mcp-lock list                                  # now shows write tools too
+    mcp-lock confirm mail send_message             # approve one confirm-tool action
+    mcp-lock revoke mail                           # back to read-only
+
+Notes:
+- **Time-boxed by default.** `--until-revoked` is opt-in. Elevation never
+  survives a broker restart.
+- **`confirm` tools** (e.g. send/delete) need a fresh, single-use `confirm` even
+  while elevated; the model cannot supply one, so they stay closed unless an
+  operator just approved that exact action.
+- Every elevation, revoke, confirm, and write-tool invocation is written to the
+  audit log.
+- A bare environment with no signing key and no registered client cannot
+  elevate — that is the intended fail-closed behaviour.
 
 ## Contributing
 
