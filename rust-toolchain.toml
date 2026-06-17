@@ -1,0 +1,7 @@
+# Pin the toolchain so local builds, contributor builds, and CI all use the
+# same compiler. Bump deliberately, in its own commit, so a toolchain change is
+# never silently bundled into a feature PR.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,17 @@
+[package]
+name = "mcp-lockd"
+description = "MCP-Lock broker daemon: supervises first-party stdio MCP servers and presents one fail-closed, default-read-only MCP endpoint. Scaffolding in Slice 0."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+mcp-lock-core = { path = "../core" }
+mcp-lock-transport = { path = "../transport" }

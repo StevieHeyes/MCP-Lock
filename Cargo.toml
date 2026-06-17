@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/transport",
+    "crates/broker",
+    "crates/cli",
+]
+
+# Shared metadata and dependency versions for every crate in the workspace.
+# Individual crates inherit these with `key.workspace = true` so versions and
+# policy are declared in exactly one place.
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/StevieHeyes/MCP-Lock"
+authors = ["Stevie Heyes"]
+
+# Lints applied across the whole workspace. CI additionally runs
+# `cargo clippy -- -D warnings`, but encoding the security-relevant lints here
+# means a local `cargo build` enforces them too.
+#
+# `unsafe_code` is `deny`, not `forbid`, so the small number of sites that will
+# need platform FFI (macOS LocalAuthentication / Keychain) can opt in with an
+# explicit, justified `#[allow(unsafe_code)]` and nowhere else.
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "warn"
+dbg_macro = "warn"
+
+[profile.release]
+# A security daemon: keep debug info available for incident triage, and abort
+# on panic so a panic in the broker fails closed (process death -> launchd
+# restart -> cold, read-only state) rather than unwinding into an unknown state.
+panic = "abort"

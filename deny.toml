@@ -1,0 +1,45 @@
+# cargo-deny configuration. Enforced in CI (see .github/workflows/ci.yml).
+#
+# Slice 0 has no external dependencies, so this passes trivially today. It is in
+# place from the start so the first dependency a later slice adds is checked for
+# vulnerabilities, license compatibility, and supply-chain provenance before it
+# can land.
+
+[advisories]
+version = 2
+# Deny crates with known security advisories or that are yanked.
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Inbound-equals-outbound is Apache-2.0 (see CONTRIBUTING.md). Allow only
+# permissive licenses compatible with redistributing under Apache-2.0. A
+# copyleft dependency must be discussed in a [DECISION] issue, not slipped in.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+# These are forward-looking allowances for dependencies later slices may pull
+# in; don't fail or warn just because they aren't used yet.
+unused-allowed-license = "allow"
+
+[bans]
+# Surface accidental dependency bloat and version skew early.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace-internal crates are referenced by path and have no version
+# requirement; that is not the dependency-confusion footgun `wildcards` targets.
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io is trusted by default. A git or alternative-registry source
+# must be added here deliberately, with justification in the PR that needs it.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

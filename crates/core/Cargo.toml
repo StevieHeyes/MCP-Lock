@@ -1,0 +1,18 @@
+[package]
+name = "mcp-lock-core"
+description = "MCP-Lock core: platform-abstraction trait seams and the child execution-context seam. No transport, no async, no platform code beyond stubs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Intentionally dependency-free in Slice 0. The security core lives here and is
+# kept plain, synchronous, and auditable; new dependencies must be justified in
+# the PR that adds them.
+[dependencies]

@@ -69,12 +69,29 @@ not add third-party servers to v1: see the scope note in SECURITY.md.
 
 ## Installation
 
-<!-- TODO(agent): complete once Slice 0/1 land. Document the Rust toolchain
-requirement, build command (cargo build --release), and where the binaries are
-produced. Do not document install steps for components that do not yet exist. -->
+Building from source is the only supported path. There are no prebuilt binaries.
 
-_Not yet available. This section will be completed as the first build slices
-land._
+Requirements:
+
+- macOS (v1 is macOS only).
+- A Rust toolchain. The exact version is pinned in
+  [`rust-toolchain.toml`](rust-toolchain.toml); if you use `rustup`, it is
+  installed automatically on first build, with the `rustfmt` and `clippy`
+  components.
+
+Build the whole workspace:
+
+    cargo build --release
+
+This produces two binaries under `target/release/`:
+
+- `mcp-lockd` — the broker daemon.
+- `mcp-lock` — the control CLI.
+
+As of Slice 0 these are scaffolding: `mcp-lockd` starts, reports its fail-closed
+posture, and exits without supervising any servers, and `mcp-lock` answers
+`--help`/`--version` only. The first runnable deliverable (the read-only mail
+server) arrives with Slice 1; see the Usage section as it is filled in.
 
 ## Usage
 

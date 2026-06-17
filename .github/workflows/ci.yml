@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # fmt, clippy (warnings denied), and tests. Runs on macOS because v1 targets
+  # macOS only: the platform providers and their fail-closed tests compile and
+  # run under `cfg(target_os = "macos")`, so macOS is the runner that actually
+  # exercises them. The toolchain is pinned by rust-toolchain.toml.
+  check:
+    name: fmt / clippy / test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --all-features
+
+  # Dependency vetting: advisories, license policy, supply-chain sources.
+  # Trivial today (no external deps) but guards the first one that lands.
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          command: check advisories bans licenses sources
+
+  # Portability guard: v1 runs only on macOS, but the platform-agnostic trait
+  # layer in mcp-lock-core should still compile on Linux so future ports stay
+  # additive. A cheap `cargo check` catches regressions the macOS job can't see.
+  portable-check:
+    name: portable check (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check (Linux)
+        run: cargo check --workspace --all-targets
+
+  # Secret scanning over the full git history. Pinned gitleaks version, run as a
+  # plain CLI so there is no third-party action with opaque behaviour on the
+  # security-sensitive path. Fails the build if any secret is detected.
+  secret-scan:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Install and run gitleaks
+        env:
+          GITLEAKS_VERSION: "8.18.4"
+          # sha256 of gitleaks_8.18.4_linux_x64.tar.gz (from the release's
+          # checksums.txt). Verified before extraction so a tampered release
+          # asset cannot execute on the security-sensitive path.
+          GITLEAKS_SHA256: "ba6dbb656933921c775ee5a2d1c13a91046e7952e9d919f9bac4cec61d628e7d"
+        run: |
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks detect --source . --redact --verbose --exit-code 1
