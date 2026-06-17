@@ -12,7 +12,14 @@ publish = false
 [lints]
 workspace = true
 
-# Intentionally dependency-free in Slice 0. The security core lives here and is
-# kept plain, synchronous, and auditable; new dependencies must be justified in
-# the PR that adds them.
+# The security core is kept dependency-light and auditable. Every dependency
+# here is justified:
+# - serde/serde_json: parse the operator manifest (JSON). Hand-rolling a parser
+#   for a security-critical config file would be more risk, not less.
+# - sha2: integrity hash of the manifest at load (RustCrypto; widely audited).
+#   The hash is a tamper-detection aid that is logged; file ownership remains the
+#   real boundary.
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
