@@ -13,7 +13,10 @@ time-boxed, presence-gated elevation. Authoritative design lives in
   (see below); v1 uses documented dev stand-ins for them.
 - **Open work is tracked in GitHub issues, milestoned `v1` / `v2`.** Get the live list with
   `gh issue list --milestone v2` (and `--milestone v1`). Don't infer the roadmap from code —
-  read the issues.
+  read the issues. Issues + milestones are the primary work-list for a session.
+- A human-facing roadmap board mirrors the same issues:
+  [MCP-Lock project](https://github.com/users/StevieHeyes/projects/1) (reading it needs the
+  `project` gh scope; the issues above are the scope-free source of truth).
 
 ## Workspace map (Cargo workspace, edition 2021, toolchain pinned 1.96.0)
 | Path | Package | Produces | Role |
