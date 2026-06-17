@@ -12,7 +12,8 @@ publish = false
 [lints]
 workspace = true
 
-# An argument parser (e.g. clap) will be added in Slice 4 when real subcommands
-# exist, and justified there. Slice 0 parses the two trivial flags by hand to
-# stay dependency-free.
+# The CLI's subcommands are few and simple, so they are parsed by hand rather
+# than pulling in an argument-parser dependency. The control-channel protocol and
+# client live in the transport crate.
 [dependencies]
+mcp-lock-transport = { path = "../transport" }

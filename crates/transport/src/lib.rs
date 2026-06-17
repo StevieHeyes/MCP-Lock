@@ -26,7 +26,12 @@
 //! The upward MCP endpoint (Slice 3c) is in [`endpoint`]: a synchronous,
 //! bearer-authenticated HTTP server that delegates every request to an
 //! [`endpoint::McpHandler`] the broker implements.
+//!
+//! The local control channel (Slice 4) is in [`control`]: a Unix-socket
+//! request/response link the CLI uses for observe + lifecycle.
 
+#[cfg(unix)]
+pub mod control;
 pub mod endpoint;
 
 /// A transport that carries length-delimited message frames in both directions.

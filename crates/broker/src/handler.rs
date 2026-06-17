@@ -14,7 +14,7 @@ use mcp_lock_core::auth::ValidatedClient;
 use mcp_lock_core::policy::Timestamp;
 use mcp_lock_transport::endpoint::McpHandler;
 
-use crate::aggregator::{Aggregator, AggregatorError};
+use crate::aggregator::Aggregator;
 
 /// MCP protocol version the broker presents upward.
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -74,16 +74,10 @@ impl BrokerMcpHandler {
         };
         match agg.call(name, arguments, now) {
             Ok(result) => success(id, result),
-            // Tool-level problems are returned as a tool result with isError so
-            // the model can see and adjust, not as a JSON-RPC protocol error.
-            Err(e @ (AggregatorError::UnknownTool(_) | AggregatorError::NotExposed(_))) => {
-                success(id, tool_error_result(&e.to_string()))
-            }
-            Err(AggregatorError::Child(e)) => success(id, tool_error_result(&e.to_string())),
-            Err(e @ AggregatorError::InvalidServerId(_)) => {
-                // Should not occur after a successful build; surface defensively.
-                success(id, tool_error_result(&e.to_string()))
-            }
+            // Any tool-level problem (unknown/not-exposed/child failure) is
+            // returned as a tool result with isError so the model can see and
+            // adjust, not as a JSON-RPC protocol error.
+            Err(e) => success(id, tool_error_result(&e.to_string())),
         }
     }
 
