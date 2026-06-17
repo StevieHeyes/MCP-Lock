@@ -25,11 +25,17 @@
 //! * [`broker`] — the in-memory, no-persistence broker state and its fail-closed
 //!   transitions.
 //!
-//! Credential handling, presence/nonce verification, and token validation arrive
-//! in the later security-reviewed slices that fill the remaining seams.
+//! Token validation landed in Slice 3a:
+//! * [`auth`] — the pluggable credential-validation seam (`CredentialValidator`,
+//!   the unforgeable `ValidatedClient`, and the ship-closed static bearer
+//!   validator).
+//!
+//! Credential handling and presence/nonce verification arrive in the later
+//! security-reviewed slices that fill the remaining seams.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod auth;
 pub mod broker;
 pub mod error;
 pub mod exec;
