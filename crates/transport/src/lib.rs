@@ -19,8 +19,15 @@
 //! channels themselves, and all authentication, land in later slices.
 //!
 //! Note on layering: credential/token *validation* is security-core policy and
-//! lives behind a seam in `mcp-lock-core`, not here. This crate moves bytes; it
-//! does not decide who is allowed to.
+//! lives behind a seam in `mcp-lock-core`, not here. This crate moves bytes and
+//! authenticates with that seam; it does not decide who is allowed to do what
+//! with a tool — that is the broker/aggregator over the security core.
+//!
+//! The upward MCP endpoint (Slice 3c) is in [`endpoint`]: a synchronous,
+//! bearer-authenticated HTTP server that delegates every request to an
+//! [`endpoint::McpHandler`] the broker implements.
+
+pub mod endpoint;
 
 /// A transport that carries length-delimited message frames in both directions.
 ///
